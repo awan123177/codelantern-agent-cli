@@ -4,6 +4,7 @@ export * from './config/schema.js';
 export * from './config/projectInstructions.js';
 export * from './provider/types.js';
 export * from './provider/registry.js';
+export * from './provider/modelClassifier.js';
 export * from './provider/gemini.js';
 export * from './provider/openaiProvider.js';
 export * from './provider/anthropicProvider.js';

@@ -15,6 +15,9 @@ import { TimeoutError, FirstTokenTimeoutError, CancelledError } from '../src/pro
 import { encryptSecret, decryptSecret, maskApiKey } from '../src/security/credentials.js';
 import { SkillManager } from '../src/skills/skillManager.js';
 import { ProviderRegistry } from '../src/provider/registry.js';
+import { handleSlashCommand, type SlashCommandContext } from '../src/ui/slashCommands.js';
+import { classifyModel, getRecommendedCodingModels } from '../src/provider/modelClassifier.js';
+import { loadConfig, saveConfig } from '../src/config/config.js';
 
 let passed = 0;
 let failed = 0;
@@ -33,6 +36,7 @@ async function test(name: string, fn: () => void | Promise<void>) {
 async function runTests() {
   console.log('\nRunning Code Lantern CLI Test Suite (Cross-Platform macOS & Windows)\n');
 
+  const initialConfig = loadConfig();
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lantern-test-'));
 
   // 1. Sandbox & Security Tests
@@ -370,8 +374,292 @@ Do thing A and thing B.
     assert.strictEqual(anthropic.displayName, 'Anthropic Claude');
   });
 
-  // Cleanup tmp dir
+  // 12. Model Classifier & Compatibility Tests
+  await test('Classifier: correctly identifies specialized vs coding models', () => {
+    const embed = classifyModel('text-embedding-3-small');
+    assert.strictEqual(embed.category, 'specialized');
+    assert.strictEqual(embed.specializedType, 'Embedding');
+    assert.strictEqual(embed.isRecommendedForCoding, false);
+
+    const image = classifyModel('dall-e-3');
+    assert.strictEqual(image.category, 'specialized');
+    assert.strictEqual(image.specializedType, 'Image Generation');
+    assert.strictEqual(image.isRecommendedForCoding, false);
+
+    const audio = classifyModel('whisper-1');
+    assert.strictEqual(audio.category, 'specialized');
+    assert.strictEqual(audio.specializedType, 'Audio/Speech');
+    assert.strictEqual(audio.isRecommendedForCoding, false);
+
+    const batch = classifyModel('gpt-4o:batch');
+    assert.strictEqual(batch.category, 'specialized');
+    assert.strictEqual(batch.specializedType, 'Batch Processing');
+    assert.strictEqual(batch.isRecommendedForCoding, false);
+
+    const chatOnly = classifyModel('custom-model', { tools: false });
+    assert.strictEqual(chatOnly.category, 'chat');
+    assert.strictEqual(chatOnly.isRecommendedForCoding, false);
+
+    const coding = classifyModel('gemini-3.8-flash', { tools: true, streaming: true });
+    assert.strictEqual(coding.category, 'coding');
+    assert.strictEqual(coding.isRecommendedForCoding, true);
+  });
+
+  await test('Classifier: getRecommendedCodingModels returns suitable models', () => {
+    const geminiRecs = getRecommendedCodingModels('gemini');
+    assert.ok(geminiRecs.includes('gemini-3.8-flash'));
+
+    const openaiRecs = getRecommendedCodingModels('openai');
+    assert.ok(openaiRecs.includes('gpt-4o'));
+
+    const openrouterRecs = getRecommendedCodingModels('openrouter');
+    assert.ok(openrouterRecs.some(m => m.includes('claude') || m.includes('gpt')));
+  });
+
+  // 13. In-Session Provider Switching via Slash Commands
+  await test('In-Session: /provider switches active session immediately and preserves turns', async () => {
+    let activeProv = 'gemini';
+    let activeMod = 'gemini-3.8-flash';
+    const mockSession = createNewSession(tmpDir, activeMod);
+    mockSession.turns.push({
+      role: 'user',
+      text: 'Hello test',
+      timestamp: new Date().toISOString()
+    });
+
+    const mockSlashContext: SlashCommandContext = {
+      session: mockSession,
+      provider: activeProv,
+      model: activeMod,
+      workspace: tmpDir,
+      yolo: false,
+      planMode: false,
+      showTiming: false,
+      activeSkills: [],
+      setProvider: (p: string) => {
+        activeProv = p;
+        mockSession.provider = p;
+      },
+      setModel: (m: string) => {
+        activeMod = m;
+        mockSession.model = m;
+      },
+      setYolo: () => {},
+      setPlanMode: () => {},
+      setShowTiming: () => {},
+      setActiveSkills: () => {}
+    };
+
+    // Switch to openrouter (which is configured in this test environment via env)
+    const handled = await handleSlashCommand('/provider openrouter', mockSlashContext);
+    assert.strictEqual(handled, true);
+    assert.strictEqual(activeProv, 'openrouter');
+    assert.strictEqual(mockSession.provider, 'openrouter');
+    assert.strictEqual(mockSession.turns.length, 1); // turns preserved
+  });
+
+  await test('In-Session: /provider default saves persistent default', async () => {
+    let activeProv = 'gemini';
+    let activeMod = 'gemini-3.8-flash';
+    const mockSession = createNewSession(tmpDir, activeMod);
+
+    const mockSlashContext: SlashCommandContext = {
+      session: mockSession,
+      provider: activeProv,
+      model: activeMod,
+      workspace: tmpDir,
+      yolo: false,
+      planMode: false,
+      showTiming: false,
+      activeSkills: [],
+      setProvider: (p: string) => {
+        activeProv = p;
+        mockSession.provider = p;
+      },
+      setModel: (m: string) => {
+        activeMod = m;
+        mockSession.model = m;
+      },
+      setYolo: () => {},
+      setPlanMode: () => {},
+      setShowTiming: () => {},
+      setActiveSkills: () => {}
+    };
+
+    const handled = await handleSlashCommand('/provider default openrouter', mockSlashContext);
+    assert.strictEqual(handled, true);
+    assert.strictEqual(activeProv, 'openrouter');
+    assert.strictEqual(loadConfig().activeProvider, 'openrouter');
+  });
+
+  await test('In-Session: /provider handles invalid provider gracefully', async () => {
+    let activeProv = 'gemini';
+    const mockSession = createNewSession(tmpDir, 'gemini-3.8-flash');
+
+    const mockSlashContext: SlashCommandContext = {
+      session: mockSession,
+      provider: activeProv,
+      model: 'gemini-3.8-flash',
+      workspace: tmpDir,
+      yolo: false,
+      planMode: false,
+      showTiming: false,
+      activeSkills: [],
+      setProvider: (p: string) => { activeProv = p; },
+      setModel: () => {},
+      setYolo: () => {},
+      setPlanMode: () => {},
+      setShowTiming: () => {},
+      setActiveSkills: () => {}
+    };
+
+    const handled = await handleSlashCommand('/provider invalid-provider-xyz', mockSlashContext);
+    assert.strictEqual(handled, true);
+    assert.strictEqual(activeProv, 'gemini'); // Not changed
+  });
+
+  // 14. In-Session Model Switching via Slash Commands
+  await test('In-Session: /model switches model and preserves conversation history', async () => {
+    let activeMod = 'gemini-3.8-flash';
+    const mockSession = createNewSession(tmpDir, activeMod);
+    mockSession.turns.push({
+      role: 'user',
+      text: 'Build a calculator',
+      timestamp: new Date().toISOString()
+    });
+
+    const mockSlashContext: SlashCommandContext = {
+      session: mockSession,
+      provider: 'gemini',
+      model: activeMod,
+      workspace: tmpDir,
+      yolo: false,
+      planMode: false,
+      showTiming: false,
+      activeSkills: [],
+      setProvider: () => {},
+      setModel: (m: string) => {
+        activeMod = m;
+        mockSession.model = m;
+      },
+      setYolo: () => {},
+      setPlanMode: () => {},
+      setShowTiming: () => {},
+      setActiveSkills: () => {}
+    };
+
+    const handled = await handleSlashCommand('/model gemini-2.5-pro', mockSlashContext);
+    assert.strictEqual(handled, true);
+    assert.strictEqual(activeMod, 'gemini-2.5-pro');
+    assert.strictEqual(mockSession.model, 'gemini-2.5-pro');
+    assert.strictEqual(mockSession.turns.length, 1);
+  });
+
+  await test('In-Session: /model rejects specialized non-coding models', async () => {
+    let activeMod = 'gemini-3.8-flash';
+    const mockSession = createNewSession(tmpDir, activeMod);
+
+    const mockSlashContext: SlashCommandContext = {
+      session: mockSession,
+      provider: 'openai',
+      model: activeMod,
+      workspace: tmpDir,
+      yolo: false,
+      planMode: false,
+      showTiming: false,
+      activeSkills: [],
+      setProvider: () => {},
+      setModel: (m: string) => { activeMod = m; },
+      setYolo: () => {},
+      setPlanMode: () => {},
+      setShowTiming: () => {},
+      setActiveSkills: () => {}
+    };
+
+    // Embedding model rejection
+    await handleSlashCommand('/model text-embedding-3-small', mockSlashContext);
+    assert.strictEqual(activeMod, 'gemini-3.8-flash'); // Did not switch
+
+    // Batch model rejection
+    await handleSlashCommand('/model gpt-4o:batch', mockSlashContext);
+    assert.strictEqual(activeMod, 'gemini-3.8-flash'); // Did not switch
+  });
+
+  await test('In-Session: /model default saves default model in config', async () => {
+    let activeMod = 'gemini-3.8-flash';
+    const mockSession = createNewSession(tmpDir, activeMod);
+
+    const mockSlashContext: SlashCommandContext = {
+      session: mockSession,
+      provider: 'gemini',
+      model: activeMod,
+      workspace: tmpDir,
+      yolo: false,
+      planMode: false,
+      showTiming: false,
+      activeSkills: [],
+      setProvider: () => {},
+      setModel: (m: string) => { activeMod = m; },
+      setYolo: () => {},
+      setPlanMode: () => {},
+      setShowTiming: () => {},
+      setActiveSkills: () => {}
+    };
+
+    await handleSlashCommand('/model default gemini-2.5-flash', mockSlashContext);
+    assert.strictEqual(activeMod, 'gemini-2.5-flash');
+    assert.strictEqual(loadConfig().defaultModel, 'gemini-2.5-flash');
+  });
+
+  // 15. Slash Commands & README Compatibility Verification
+  await test('In-Session: all documented slash commands execute cleanly', async () => {
+    const mockSession = createNewSession(tmpDir, 'gemini-3.8-flash');
+    const mockSlashContext: SlashCommandContext = {
+      session: mockSession,
+      provider: 'gemini',
+      model: 'gemini-3.8-flash',
+      workspace: tmpDir,
+      yolo: false,
+      planMode: false,
+      showTiming: false,
+      activeSkills: [],
+      setProvider: () => {},
+      setModel: () => {},
+      setYolo: () => {},
+      setPlanMode: () => {},
+      setShowTiming: () => {},
+      setActiveSkills: () => {}
+    };
+
+    const documentedSlashCommands = [
+      '/help',
+      '/status',
+      '/clear',
+      '/sessions',
+      '/history',
+      '/timing on',
+      '/timing off',
+      '/plan on',
+      '/plan off',
+      '/yolo on',
+      '/yolo off',
+      '/export json',
+      '/export md'
+    ];
+
+    for (const cmd of documentedSlashCommands) {
+      const res = await handleSlashCommand(cmd, mockSlashContext);
+      assert.strictEqual(res, true, `Command '${cmd}' should return true`);
+    }
+
+    // /exit and /quit return false to stop the REPL loop cleanly
+    assert.strictEqual(await handleSlashCommand('/exit', mockSlashContext), false);
+    assert.strictEqual(await handleSlashCommand('/quit', mockSlashContext), false);
+  });
+
+  // Cleanup tmp dir and restore initial config
   try {
+    saveConfig(initialConfig);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   } catch {
     // ignore

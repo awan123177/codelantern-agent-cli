@@ -61,6 +61,9 @@ export class GeminiProvider implements IProviderAdapter {
   }
 
   public async testConnection(): Promise<ProviderTestResult> {
+    if (!this.isConfigured()) {
+      return { success: false, latencyMs: 0, error: `Missing API key for ${this.displayName}` };
+    }
     const startTime = Date.now();
     try {
       const client = this.getClient();

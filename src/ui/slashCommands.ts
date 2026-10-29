@@ -2,7 +2,10 @@ import pc from 'picocolors';
 import { listSessions, exportSessionMarkdown } from '../session/sessionManager.js';
 import { ProviderRegistry } from '../provider/registry.js';
 import { SkillManager } from '../skills/skillManager.js';
-import type { OrbitSession } from '../types.js';
+import { loadConfig, setConfigValue } from '../config/config.js';
+import { getApiKey } from '../security/credentials.js';
+import { classifyModel, getRecommendedCodingModels } from '../provider/modelClassifier.js';
+import type { OrbitSession, ProviderModelInfo } from '../types.js';
 
 export interface SlashCommandContext {
   session: OrbitSession;
@@ -19,6 +22,7 @@ export interface SlashCommandContext {
   setPlanMode: (p: boolean) => void;
   setShowTiming: (t: boolean) => void;
   setActiveSkills: (skills: string[]) => void;
+  askQuestion?: (query: string) => Promise<string>;
 }
 
 export async function handleSlashCommand(input: string, context: SlashCommandContext): Promise<boolean> {
@@ -30,12 +34,16 @@ export async function handleSlashCommand(input: string, context: SlashCommandCon
     case '/help':
       console.log('\n' + pc.bold(pc.yellow('🏮 Code Lantern CLI — Help & Commands')));
       console.log(pc.dim('──────────────────────────────────────────────────────────────────────────────'));
-      console.log(pc.bold('Slash Commands:'));
+      console.log(pc.bold('Slash Commands (Entered inside Lantern session):'));
       console.log(`  ${pc.cyan('/help')}                 Show this help overview`);
       console.log(`  ${pc.cyan('/clear')}                Clear the terminal screen`);
       console.log(`  ${pc.cyan('/status')}               Display session, provider, model, and skill status`);
-      console.log(`  ${pc.cyan('/provider [name]')}      View or switch active AI provider (gemini, openai, anthropic, openrouter)`);
-      console.log(`  ${pc.cyan('/model [id]')}           View or switch active model`);
+      console.log(`  ${pc.cyan('/provider')}             List configured providers and select one interactively`);
+      console.log(`  ${pc.cyan('/provider <name>')}      Switch current session to provider (gemini, openrouter, openai, anthropic)`);
+      console.log(`  ${pc.cyan('/provider default <name>')} Set provider as default and switch session`);
+      console.log(`  ${pc.cyan('/model')}                Discover & browse models for active provider with interactive selection`);
+      console.log(`  ${pc.cyan('/model <model-id>')}     Switch current session to specified model`);
+      console.log(`  ${pc.cyan('/model default <id>')}   Set model as default and switch session`);
       console.log(`  ${pc.cyan('/skills [name]')}        List, enable, or disable active skills`);
       console.log(`  ${pc.cyan('/timing [on|off]')}      Toggle request timing diagnostics display`);
       console.log(`  ${pc.cyan('/plan [on|off]')}        Toggle read-only planning mode`);
@@ -77,38 +85,294 @@ export async function handleSlashCommand(input: string, context: SlashCommandCon
 
     case '/provider': {
       const registry = new ProviderRegistry();
-      if (arg) {
-        const norm = arg.toLowerCase().trim();
-        if (registry.hasProvider(norm)) {
-          context.setProvider(norm);
-          const p = registry.getProvider(norm);
-          context.setModel(p.defaultModel);
-          console.log(pc.green(`✓ Switched provider to '${p.displayName}' (default model: ${p.defaultModel})`));
+      const trimmedArg = arg.trim();
+
+      const switchProvider = async (target: string, isDefault = false): Promise<void> => {
+        const norm = target.toLowerCase().trim();
+        if (!registry.hasProvider(norm)) {
+          console.log(pc.red(`Provider '${target}' not found. Available: ${registry.listProviders().map(p => p.id).join(', ')}`));
+          return;
+        }
+
+        const p = registry.getProvider(norm);
+        if (!p.isConfigured()) {
+          console.log('\n' + pc.yellow(`⚠️ Provider '${p.displayName}' has no API key configured.`));
+          console.log(pc.dim('To configure this provider:'));
+          console.log(pc.dim(`  • In shell: export ${norm.toUpperCase()}_API_KEY="your-api-key"`));
+          console.log(pc.dim(`  • Or run:   lantern keys set ${norm}`));
+          console.log(pc.dim('  (API keys are encrypted locally using AES-256-GCM)\n'));
+          return;
+        }
+
+        // Connection verification check
+        console.log(pc.dim(`Verifying connection to ${p.displayName}...`));
+        const testRes = await p.testConnection();
+        if (!testRes.success) {
+          console.log(pc.yellow(`⚠️ Connection warning for ${p.displayName}: ${testRes.error || 'Network error'}`));
+          console.log(pc.dim(`  You can test provider connectivity from the shell: lantern providers test ${norm}`));
         } else {
-          console.log(pc.red(`Provider '${arg}' not found. Available: ${registry.listProviders().map(p => p.id).join(', ')}`));
+          console.log(pc.dim(`✓ Verified ${p.displayName} connection (${testRes.latencyMs}ms)`));
         }
-      } else {
-        const providers = registry.listProviders();
-        console.log(`\nCurrent provider: ${pc.magenta(context.provider)}`);
-        console.log('Available providers:');
-        for (const p of providers) {
-          const active = p.id === context.provider ? pc.green(' (active)') : '';
-          console.log(`  - ${pc.bold(p.id)}: ${p.displayName} [${p.isConfigured ? pc.green('Ready') : pc.yellow('Needs key')}]${active}`);
+
+        // Update active session & context immediately
+        context.setProvider(norm);
+        context.setModel(p.defaultModel);
+
+        if (isDefault) {
+          setConfigValue('activeProvider', norm);
+          console.log(pc.green(`✓ Saved '${p.displayName}' as default provider and switched active session.`));
+        } else {
+          console.log(pc.green(`✓ Switched provider to '${p.displayName}' (model: ${p.defaultModel}).`));
         }
-        console.log(pc.dim(`Usage: /provider <name> (e.g. /provider openai)`));
+
+        if (context.session.turns.length > 0) {
+          console.log(pc.dim(`  Preserved ${context.session.turns.length} conversation turn(s) for this session.`));
+        }
+      };
+
+      if (trimmedArg.toLowerCase().startsWith('default ')) {
+        const target = trimmedArg.slice(8).trim();
+        if (!target) {
+          console.log(pc.yellow('Usage: /provider default <name> (e.g. /provider default openrouter)'));
+          return true;
+        }
+        await switchProvider(target, true);
+        return true;
+      }
+
+      if (trimmedArg) {
+        await switchProvider(trimmedArg, false);
+        return true;
+      }
+
+      // No arguments: list configured providers and allow selection
+      const providers = registry.listProviders();
+      console.log('\n' + pc.bold(pc.yellow('🏮 Configured AI Providers')));
+      console.log(pc.dim('──────────────────────────────────────────────────────────────────────────────'));
+      console.log(
+        pc.bold('#'.padEnd(4)) +
+        pc.bold('Provider'.padEnd(16)) +
+        pc.bold('Status'.padEnd(16)) +
+        pc.bold('Default Model'.padEnd(28)) +
+        pc.bold('Key Source')
+      );
+      console.log(pc.dim('──────────────────────────────────────────────────────────────────────────────'));
+
+      for (let i = 0; i < providers.length; i++) {
+        const p = providers[i];
+        const num = pc.dim(`${i + 1}.`.padEnd(4));
+        const activeMarker = p.id === context.provider ? pc.green(' (active)') : '';
+        const nameCol = (p.id + activeMarker).padEnd(20);
+        const statusCol = p.isConfigured ? pc.green('✓ Ready').padEnd(18) : pc.yellow('! Needs Key').padEnd(18);
+        const modelCol = pc.cyan(p.defaultModel).padEnd(30);
+        const keyInfo = getApiKey(p.id);
+        const srcCol = keyInfo.source ? pc.cyan(`[${keyInfo.source}]`) : pc.dim('(missing)');
+
+        console.log(`${num}${nameCol}${statusCol}${modelCol}${srcCol}`);
+      }
+
+      console.log(pc.dim('\nUsage:'));
+      console.log(pc.dim('  /provider <name>            Switch current session to provider'));
+      console.log(pc.dim('  /provider default <name>    Set as persistent default and switch session'));
+
+      if (context.askQuestion) {
+        const answer = await context.askQuestion(
+          pc.cyan(`\nSelect provider [1-${providers.length} or enter name] (Enter to cancel): `)
+        );
+        if (answer) {
+          const num = parseInt(answer, 10);
+          if (!isNaN(num) && num >= 1 && num <= providers.length) {
+            await switchProvider(providers[num - 1].id, false);
+          } else {
+            await switchProvider(answer, false);
+          }
+        }
       }
       return true;
     }
 
-    case '/model':
-      if (arg) {
-        context.setModel(arg.trim());
-        console.log(pc.green(`✓ Model changed to: ${arg.trim()}`));
-      } else {
-        console.log(`Current model: ${pc.cyan(context.model)} (Provider: ${context.provider})`);
-        console.log(pc.dim(`Usage: /model <model-id> (or run 'lantern models list' to view available models)`));
+    case '/model': {
+      const registry = new ProviderRegistry();
+      const p = registry.getProvider(context.provider);
+      const trimmedArg = arg.trim();
+
+      const switchModel = (targetModelId: string, isDefault = false): void => {
+        const classification = classifyModel(targetModelId);
+
+        if (classification.category === 'specialized') {
+          console.log('\n' + pc.red(`❌ Cannot use specialized ${classification.specializedType} model '${targetModelId}' for interactive coding.`));
+          if (classification.warning) {
+            console.log(pc.dim(`  ${classification.warning}`));
+          }
+          const recs = getRecommendedCodingModels(context.provider);
+          console.log(pc.yellow(`\nCompatible coding models for ${p.displayName}:`));
+          for (const rec of recs) {
+            console.log(`  - ${pc.bold(pc.cyan(rec))}`);
+          }
+          console.log('');
+          return;
+        }
+
+        if (classification.category === 'chat') {
+          console.log('\n' + pc.yellow(`⚠️ Warning: Model '${targetModelId}' does not support tool use / function calling.`));
+          console.log(pc.dim('  Lantern will answer chat questions, but cannot inspect files, edit code, or run shell commands.'));
+          const recs = getRecommendedCodingModels(context.provider);
+          console.log(pc.dim(`  Recommended coding models with tool support: ${recs.join(', ')}\n`));
+        }
+
+        // Apply switch
+        context.setModel(targetModelId);
+
+        if (isDefault) {
+          setConfigValue('defaultModel', targetModelId);
+          console.log(pc.green(`✓ Saved model '${targetModelId}' as default and switched active session.`));
+        } else {
+          console.log(pc.green(`✓ Switched model to: ${targetModelId}`));
+        }
+
+        if (context.session.turns.length > 0) {
+          console.log(pc.dim(`  Preserved ${context.session.turns.length} conversation turn(s) for this session.`));
+        }
+      };
+
+      if (trimmedArg.toLowerCase().startsWith('default ')) {
+        const target = trimmedArg.slice(8).trim();
+        if (!target) {
+          console.log(pc.yellow('Usage: /model default <model-id> (e.g. /model default gemini-3.8-flash)'));
+          return true;
+        }
+        switchModel(target, true);
+        return true;
+      }
+
+      if (trimmedArg) {
+        switchModel(trimmedArg, false);
+        return true;
+      }
+
+      // No arguments: discover models for active provider
+      console.log(pc.dim(`\nDiscovering available models for ${p.displayName}...`));
+      let models: ProviderModelInfo[] = [];
+      let discoveryError: string | null = null;
+
+      try {
+        models = await p.listModels();
+      } catch (err: any) {
+        discoveryError = err.message || String(err);
+      }
+
+      if (models.length === 0) {
+        if (discoveryError) {
+          console.log(pc.yellow(`⚠️ Model discovery unavailable for ${p.displayName}: ${discoveryError}`));
+        } else {
+          console.log(pc.yellow(`No models returned by discovery for ${p.displayName}.`));
+        }
+        console.log(pc.dim(`You can manually enter any model ID supported by ${p.displayName}.`));
+        console.log(`Current model: ${pc.cyan(context.model)}`);
+
+        if (context.askQuestion) {
+          const manual = await context.askQuestion(
+            pc.cyan(`Enter model ID to switch (or press Enter to cancel): `)
+          );
+          if (manual) {
+            switchModel(manual, false);
+          }
+        }
+        return true;
+      }
+
+      // Separate into interactive coding models vs chat-only vs specialized
+      const codingModels: Array<{ info: ProviderModelInfo; classification: ReturnType<typeof classifyModel> }> = [];
+      const chatOnlyModels: Array<{ info: ProviderModelInfo; classification: ReturnType<typeof classifyModel> }> = [];
+      const specializedModels: Array<{ info: ProviderModelInfo; classification: ReturnType<typeof classifyModel> }> = [];
+
+      for (const m of models) {
+        const c = classifyModel(m.id, m.capabilities, m.description);
+        if (c.category === 'coding') {
+          codingModels.push({ info: m, classification: c });
+        } else if (c.category === 'chat') {
+          chatOnlyModels.push({ info: m, classification: c });
+        } else {
+          specializedModels.push({ info: m, classification: c });
+        }
+      }
+
+      console.log('\n' + pc.bold(pc.yellow(`🏮 Available Models for ${p.displayName}`)));
+      console.log(pc.dim('──────────────────────────────────────────────────────────────────────────────'));
+      console.log(
+        pc.bold('#'.padEnd(4)) +
+        pc.bold('Model ID'.padEnd(36)) +
+        pc.bold('Tools'.padEnd(8)) +
+        pc.bold('Vision'.padEnd(8)) +
+        pc.bold('Reasoning'.padEnd(12)) +
+        pc.bold('Context Window')
+      );
+      console.log(pc.dim('──────────────────────────────────────────────────────────────────────────────'));
+
+      const selectableList: Array<{ id: string; category: string }> = [];
+
+      // Render Coding Models
+      let index = 1;
+      for (const item of codingModels) {
+        const m = item.info;
+        const isCurrent = m.id === context.model;
+        const marker = isCurrent ? pc.green(' (active)') : '';
+        const idCol = (m.id + marker).slice(0, 34).padEnd(36);
+        const toolsCol = pc.green('✓').padEnd(8);
+        const visionCol = m.capabilities.images ? pc.green('✓').padEnd(8) : pc.dim('✗').padEnd(8);
+        const reasoningCol = m.capabilities.reasoning ? pc.magenta('✓').padEnd(12) : pc.dim('✗').padEnd(12);
+        const ctxCol = m.contextWindow ? `${(m.contextWindow / 1000).toFixed(0)}k` : pc.dim('standard');
+
+        console.log(`${pc.dim(`${index}.`.padEnd(4))}${idCol}${toolsCol}${visionCol}${reasoningCol}${ctxCol}`);
+        selectableList.push({ id: m.id, category: 'coding' });
+        index++;
+      }
+
+      // Render Chat-Only Models if any exist
+      if (chatOnlyModels.length > 0) {
+        console.log(pc.dim('\nChat-Only Models (No tool execution / file editing):'));
+        for (const item of chatOnlyModels.slice(0, 5)) {
+          const m = item.info;
+          const isCurrent = m.id === context.model;
+          const marker = isCurrent ? pc.green(' (active)') : '';
+          const idCol = (m.id + marker).slice(0, 34).padEnd(36);
+          const toolsCol = pc.dim('✗').padEnd(8);
+          const visionCol = m.capabilities.images ? pc.green('✓').padEnd(8) : pc.dim('✗').padEnd(8);
+          const reasoningCol = m.capabilities.reasoning ? pc.magenta('✓').padEnd(12) : pc.dim('✗').padEnd(12);
+          const ctxCol = m.contextWindow ? `${(m.contextWindow / 1000).toFixed(0)}k` : pc.dim('standard');
+
+          console.log(`${pc.dim(`${index}.`.padEnd(4))}${idCol}${toolsCol}${visionCol}${reasoningCol}${ctxCol}`);
+          selectableList.push({ id: m.id, category: 'chat' });
+          index++;
+        }
+      }
+
+      // Show summary of specialized models if any
+      if (specializedModels.length > 0) {
+        console.log(pc.dim('\nSpecialized Models (Embeddings, Batch, Audio, Images - not suitable for coding):'));
+        const samples = specializedModels.slice(0, 6).map(s => `${s.info.id} [${s.classification.specializedType || 'Specialized'}]`).join(', ');
+        console.log(pc.dim(`  ${samples}${specializedModels.length > 6 ? ` (+${specializedModels.length - 6} more)` : ''}`));
+      }
+
+      console.log(pc.dim('\nUsage:'));
+      console.log(pc.dim('  /model <model-id>           Switch current session to model'));
+      console.log(pc.dim('  /model default <model-id>   Set as persistent default and switch session'));
+
+      if (context.askQuestion) {
+        const answer = await context.askQuestion(
+          pc.cyan(`\nSelect model [1-${selectableList.length} or enter model ID] (Enter to keep current): `)
+        );
+        if (answer) {
+          const num = parseInt(answer, 10);
+          if (!isNaN(num) && num >= 1 && num <= selectableList.length) {
+            switchModel(selectableList[num - 1].id, false);
+          } else {
+            switchModel(answer, false);
+          }
+        }
       }
       return true;
+    }
 
     case '/skills': {
       const manager = new SkillManager();

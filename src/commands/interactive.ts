@@ -82,30 +82,38 @@ export async function interactiveCommand(options: {
     setProvider: (p: string) => {
       provider = p;
       session.provider = p;
+      slashContext.provider = p;
     },
     setModel: (m: string) => {
       model = m;
       session.model = m;
+      slashContext.model = m;
     },
     setYolo: (y: boolean) => {
       yolo = y;
+      slashContext.yolo = y;
     },
     setPlanMode: (p: boolean) => {
       planMode = p;
+      slashContext.planMode = p;
     },
     setShowTiming: (t: boolean) => {
       showTiming = t;
+      slashContext.showTiming = t;
     },
     setActiveSkills: (skills: string[]) => {
       activeSkills = skills;
       session.activeSkills = skills;
-    }
+      slashContext.activeSkills = skills;
+    },
+    askQuestion: (q: string) => promptUI.askQuestion(q)
   };
 
   try {
     while (true) {
-      const modeIndicator = planMode ? pc.blue('[plan] ') : yolo ? pc.red('[yolo] ') : '';
-      const promptStr = `${pc.yellow('lantern')} ${modeIndicator}${pc.dim('❯')} `;
+      const provIndicator = pc.cyan(`(${provider})`);
+      const modeIndicator = planMode ? pc.blue(' [plan]') : yolo ? pc.red(' [yolo]') : '';
+      const promptStr = `${pc.yellow('lantern')} ${provIndicator}${modeIndicator} ${pc.dim('❯')} `;
 
       const input = await promptUI.askPrompt(promptStr);
 

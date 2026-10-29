@@ -50,18 +50,34 @@ export class OpenRouterProvider extends OpenAIProvider {
       if (res.ok) {
         const json = await res.json() as any;
         if (Array.isArray(json?.data)) {
-          const models: ProviderModelInfo[] = json.data.slice(0, 100).map((m: any) => ({
-            id: m.id,
-            name: m.name || m.id,
-            provider: this.id,
-            description: m.description,
-            contextWindow: m.context_length || 128000,
-            capabilities: this.getCapabilities(m.id),
-            pricing: m.pricing ? {
-              promptPer1k: parseFloat(m.pricing.prompt) * 1000,
-              completionPer1k: parseFloat(m.pricing.completion) * 1000
-            } : undefined
-          }));
+          const models: ProviderModelInfo[] = json.data.slice(0, 100).map((m: any) => {
+            const hasTools = Array.isArray(m.supported_parameters)
+              ? m.supported_parameters.includes('tools')
+              : !m.id.includes(':free') && !m.id.includes('deepseek-r1');
+            const hasVision = typeof m.architecture?.modality === 'string'
+              ? m.architecture.modality.includes('image')
+              : (m.id.includes('vision') || m.id.includes('gpt-4o') || m.id.includes('claude-3'));
+            const isReasoning = m.id.includes('r1') || m.id.includes('o1') || m.id.includes('o3') || m.id.includes('reason');
+
+            return {
+              id: m.id,
+              name: m.name || m.id,
+              provider: this.id,
+              description: m.description,
+              contextWindow: m.context_length || 128000,
+              capabilities: {
+                streaming: true,
+                tools: hasTools,
+                images: hasVision,
+                reasoning: isReasoning,
+                contextWindow: m.context_length || 128000
+              },
+              pricing: m.pricing ? {
+                promptPer1k: parseFloat(m.pricing.prompt) * 1000,
+                completionPer1k: parseFloat(m.pricing.completion) * 1000
+              } : undefined
+            };
+          });
           return models;
         }
       }
