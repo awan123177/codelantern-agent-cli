@@ -1,0 +1,15 @@
+src/
+test/
+.github/
+.git/
+.gitignore
+.npmignore
+.env*
+.codelantern/
+.orbit/
+*.log
+tsconfig.json
+tsup.config.ts
+LANTERN.md
+ORBIT.md
+orbit.config.example.json

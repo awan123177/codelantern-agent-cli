@@ -1,0 +1,30 @@
+{
+  "activeProvider": "gemini",
+  "defaultModel": "gemini-3.8-flash",
+  "maxSteps": 25,
+  "temperature": 0.2,
+  "maxOutputTokens": 8192,
+  "yolo": false,
+  "theme": "default",
+  "autoCompactThreshold": 30,
+  "timeoutMs": 60000,
+  "firstTokenTimeoutMs": 30000,
+  "showTiming": false,
+  "lowLatency": false,
+  "activeSkills": [],
+  "providers": {
+    "local-ollama": {
+      "type": "custom",
+      "displayName": "Local Ollama",
+      "baseUrl": "http://localhost:11434/v1",
+      "defaultModel": "llama3.2:latest"
+    }
+  },
+  "mcpServers": {
+    "sqlite": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sqlite", "./data/app.db"],
+      "disabled": false
+    }
+  }
+}

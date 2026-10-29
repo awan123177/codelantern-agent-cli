@@ -1,0 +1,56 @@
+{
+  "name": "codelantern-agent-cli",
+  "version": "1.0.1",
+  "description": "Code Lantern CLI - Personal AI coding assistant for the terminal with multi-provider and skills support",
+  "type": "module",
+  "bin": {
+    "lantern": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "test": "tsx test/index.test.ts",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "ai",
+    "cli",
+    "gemini",
+    "code-lantern",
+    "coding-assistant",
+    "developer-tools",
+    "terminal",
+    "mcp",
+    "windows",
+    "macos"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@google/genai": "^2.32.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "commander": "^14.0.3",
+    "diff": "^8.0.4",
+    "fast-glob": "^3.3.3",
+    "ignore": "^7.0.5",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.8.2"
+  }
+}
