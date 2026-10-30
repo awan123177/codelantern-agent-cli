@@ -12,7 +12,19 @@ import { validateConfigValue } from '../src/config/schema.js';
 import { formatTerminalDiff, formatNewFilePreview } from '../src/approval/diffViewer.js';
 import { createLinkedAbortController, wrapStreamWithFirstTokenTimeout } from '../src/provider/timeout.js';
 import { TimeoutError, FirstTokenTimeoutError, CancelledError } from '../src/provider/errors.js';
-import { encryptSecret, decryptSecret, maskApiKey } from '../src/security/credentials.js';
+import {
+  encryptSecret,
+  decryptSecret,
+  maskApiKey,
+  getApiKey,
+  setApiKey,
+  removeApiKey,
+  listConfiguredKeys,
+  getStoreName,
+  migrateLegacyCredentials
+} from '../src/security/credentials.js';
+import { NativeCredentialStore } from '../src/security/nativeStore.js';
+import { formatErrorMessage } from '../src/provider/errors.js';
 import { SkillManager } from '../src/skills/skillManager.js';
 import { ProviderRegistry } from '../src/provider/registry.js';
 import { handleSlashCommand, type SlashCommandContext } from '../src/ui/slashCommands.js';
@@ -333,6 +345,209 @@ async function runTests() {
     assert.strictEqual(maskApiKey(''), '(not configured)');
     assert.strictEqual(maskApiKey('tiny'), '********');
     assert.strictEqual(maskApiKey('AIzaSyD91234567890abcdefghij'), 'AIza...ghij');
+  });
+
+  // Native OS Credential Store & Key Persistence Tests
+  await test('NativeStore: detects appropriate OS credential store', () => {
+    const store = NativeCredentialStore.getInstance();
+    assert.strictEqual(store.isAvailable(), true);
+    const storeName = store.getStoreName();
+    if (process.platform === 'darwin') {
+      assert.ok(storeName.includes('Keychain'));
+    } else if (process.platform === 'win32') {
+      assert.ok(storeName.includes('Credential Manager'));
+    }
+  });
+
+  await test('Credentials: key entered once is retrieved automatically without re-entering', () => {
+    const testProv = 'test_auto_reuse';
+    const testKey = 'sk-test-unique-key-1234567890';
+    try {
+      setApiKey(testProv, testKey);
+      const res1 = getApiKey(testProv);
+      assert.strictEqual(res1.key, testKey);
+      assert.strictEqual(res1.source, 'store');
+
+      // Subsequent query in a separate call gets it automatically
+      const res2 = getApiKey(testProv);
+      assert.strictEqual(res2.key, testKey);
+    } finally {
+      removeApiKey(testProv);
+      assert.strictEqual(getApiKey(testProv).key, null);
+    }
+  });
+
+  await test('Credentials: each provider retrieves its own distinct key (isolation)', () => {
+    const provA = 'test_isolation_a';
+    const provB = 'test_isolation_b';
+    const keyA = 'AIzaSyA-Key1234567890';
+    const keyB = 'sk-ant-B-Key1234567890';
+
+    try {
+      setApiKey(provA, keyA);
+      setApiKey(provB, keyB);
+
+      assert.strictEqual(getApiKey(provA).key, keyA);
+      assert.strictEqual(getApiKey(provB).key, keyB);
+      assert.notStrictEqual(getApiKey(provA).key, getApiKey(provB).key);
+    } finally {
+      removeApiKey(provA);
+      removeApiKey(provB);
+    }
+  });
+
+  await test('Credentials: environment variables override stored credentials', () => {
+    const prov = 'gemini';
+    const storedKey = 'AIzaSyStoredKeyInKeychain12345';
+    const envKey = 'AIzaSyEnvOverrideKey67890';
+
+    const origEnv = process.env.GEMINI_API_KEY;
+    try {
+      setApiKey(prov, storedKey);
+
+      // 1. Without env var: gets stored key
+      delete process.env.GEMINI_API_KEY;
+      delete process.env.GOOGLE_API_KEY;
+      const fromStore = getApiKey(prov);
+      assert.strictEqual(fromStore.key, storedKey);
+      assert.strictEqual(fromStore.source, 'store');
+
+      // 2. With env var: env var takes precedence
+      process.env.GEMINI_API_KEY = envKey;
+      const fromEnv = getApiKey(prov);
+      assert.strictEqual(fromEnv.key, envKey);
+      assert.strictEqual(fromEnv.source, 'env');
+      assert.ok(fromEnv.sourceDescription?.includes('GEMINI_API_KEY'));
+    } finally {
+      if (origEnv) {
+        process.env.GEMINI_API_KEY = origEnv;
+      } else {
+        delete process.env.GEMINI_API_KEY;
+      }
+      removeApiKey(prov);
+    }
+  });
+
+  await test('Credentials: replacing and removing keys works cleanly', () => {
+    const prov = 'test_replace_remove';
+    const key1 = 'sk-initial-key-1111';
+    const key2 = 'sk-replaced-key-2222';
+
+    try {
+      setApiKey(prov, key1);
+      assert.strictEqual(getApiKey(prov).key, key1);
+
+      // Replace key
+      setApiKey(prov, key2);
+      assert.strictEqual(getApiKey(prov).key, key2);
+
+      // Remove key
+      const removed = removeApiKey(prov);
+      assert.strictEqual(removed, true);
+      assert.strictEqual(getApiKey(prov).key, null);
+    } finally {
+      removeApiKey(prov);
+    }
+  });
+
+  await test('Credentials: legacy credentials migrate without exposing keys or losing data', () => {
+    const legacyDir = path.join(os.homedir(), '.codelantern');
+    const legacyPath = path.join(legacyDir, 'credentials.json');
+    const backupPath = path.join(legacyDir, 'credentials.json.bak_test');
+
+    // Backup existing if any
+    let hadExisting = false;
+    if (fs.existsSync(legacyPath)) {
+      hadExisting = true;
+      fs.copyFileSync(legacyPath, backupPath);
+    }
+
+    try {
+      // Create a test legacy file with an encrypted key
+      const mockKey = 'sk-or-v1-legacy-migrated-secret-key-abcdef';
+      const mockEncrypted = encryptSecret(mockKey);
+      fs.writeFileSync(legacyPath, JSON.stringify({
+        test_migrated_prov: mockEncrypted
+      }, null, 2), { encoding: 'utf8', mode: 0o600 });
+
+      // Run migration
+      const report = migrateLegacyCredentials(true);
+      assert.strictEqual(report.attempted, true);
+      assert.ok(report.migratedProviders.includes('test_migrated_prov'));
+
+      // Verify it is now in OS credential store
+      const retrieved = getApiKey('test_migrated_prov');
+      assert.strictEqual(retrieved.key, mockKey);
+      assert.strictEqual(retrieved.source, 'store');
+    } finally {
+      removeApiKey('test_migrated_prov');
+      // Restore backup if any
+      if (hadExisting && fs.existsSync(backupPath)) {
+        fs.copyFileSync(backupPath, legacyPath);
+        fs.rmSync(backupPath, { force: true });
+      }
+    }
+  });
+
+  await test('Credentials: partially failed migration preserves unmigrated keys for safe retry', () => {
+    const legacyDir = path.join(os.homedir(), '.codelantern');
+    const legacyPath = path.join(legacyDir, 'credentials.json');
+    const backupPath = path.join(legacyDir, 'credentials.json.bak_retry');
+
+    let hadExisting = false;
+    if (fs.existsSync(legacyPath)) {
+      hadExisting = true;
+      fs.copyFileSync(legacyPath, backupPath);
+    }
+
+    try {
+      const goodKey = 'sk-good-key-migrated-12345';
+      const goodEnc = encryptSecret(goodKey);
+      const corruptEnc = 'corrupt:invalid:payload';
+
+      fs.writeFileSync(legacyPath, JSON.stringify({
+        test_good: goodEnc,
+        test_bad: corruptEnc
+      }, null, 2), { encoding: 'utf8', mode: 0o600 });
+
+      // Migrate
+      const report = migrateLegacyCredentials(true);
+      assert.strictEqual(report.attempted, true);
+      assert.ok(report.migratedProviders.includes('test_good'));
+      assert.ok(report.failedProviders.includes('test_bad'));
+
+      // Verify legacy file still exists and contains test_bad (crash safe retry preserved)
+      assert.strictEqual(fs.existsSync(legacyPath), true);
+      const remaining = JSON.parse(fs.readFileSync(legacyPath, 'utf8'));
+      assert.strictEqual(remaining.test_bad, corruptEnc);
+      assert.strictEqual(remaining.test_good, undefined);
+    } finally {
+      removeApiKey('test_good');
+      if (hadExisting && fs.existsSync(backupPath)) {
+        fs.copyFileSync(backupPath, legacyPath);
+        fs.rmSync(backupPath, { force: true });
+      } else {
+        try { fs.rmSync(legacyPath, { force: true }); } catch {}
+      }
+    }
+  });
+
+  await test('Credentials: sanitizeSecrets masks OpenAI, Anthropic, OpenRouter, Google and env keys', () => {
+    const raw = 'Keys: AIzaSyD9ExampleKey1234567890abcdefghij, sk-proj-1234567890abcdefghijklmnopqrstuvwxyz, sk-ant-1234567890abcdefghijklmnopqrstuvwxyz, sk-or-v1-1234567890abcdefghijklmnopqrstuvwxyz';
+    const sanitized = sanitizeSecrets(raw);
+    assert.ok(!sanitized.includes('AIzaSyD9ExampleKey1234567890abcdefghij'));
+    assert.ok(!sanitized.includes('sk-proj-1234567890abcdefghijklmnopqrstuvwxyz'));
+    assert.ok(!sanitized.includes('sk-ant-1234567890abcdefghijklmnopqrstuvwxyz'));
+    assert.ok(!sanitized.includes('sk-or-v1-1234567890abcdefghijklmnopqrstuvwxyz'));
+    assert.ok(sanitized.includes('AIza***********************************'));
+    assert.ok(sanitized.includes('sk-************************************'));
+  });
+
+  await test('Credentials: error messages and formatting never reveal keys', () => {
+    const secretKey = 'sk-test-super-secret-key-1234567890';
+    const rawError = new Error(`Connection failed with key ${secretKey} on endpoint`);
+    const formatted = formatErrorMessage(rawError);
+    assert.ok(!formatted.includes(secretKey));
   });
 
   // 10. Skills System (SKILL.md)

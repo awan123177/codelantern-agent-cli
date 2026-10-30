@@ -15,6 +15,7 @@ export * from './provider/attachment.js';
 export * from './security/sandbox.js';
 export * from './security/secrets.js';
 export * from './security/commandGuard.js';
+export * from './security/nativeStore.js';
 export * from './security/credentials.js';
 export * from './approval/approver.js';
 export * from './approval/diffViewer.js';

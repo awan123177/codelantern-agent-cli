@@ -7,6 +7,8 @@ import { TerminalPrompt } from '../ui/prompt.js';
 import { printBanner } from '../ui/banner.js';
 import { handleSlashCommand } from '../ui/slashCommands.js';
 import { formatErrorMessage, CancelledError } from '../provider/errors.js';
+import { getApiKey, setApiKey, maskApiKey, promptMaskedApiKey, getStoreName } from '../security/credentials.js';
+import { ProviderRegistry } from '../provider/registry.js';
 import type { OrbitSession, AgentContext } from '../types.js';
 
 export async function interactiveCommand(options: {
@@ -53,13 +55,25 @@ export async function interactiveCommand(options: {
   const attachments = loadAttachments(options.attach);
 
   printBanner({
-    version: '1.0.1',
+    version: '1.0.2',
     provider,
     model,
     workspace,
     yolo,
     planMode
   });
+
+  const initialKeyInfo = getApiKey(provider);
+  if (!initialKeyInfo.key && process.stdin.isTTY) {
+    const p = new ProviderRegistry().getProvider(provider);
+    console.log(pc.yellow(`\n🏮 No API key configured for ${p.displayName} (${provider}).`));
+    console.log(pc.dim(`Lantern will securely store this key in your ${getStoreName()} so you only enter it once.\n`));
+    const entered = await promptMaskedApiKey(`Enter API key for '${provider}'`);
+    if (entered) {
+      setApiKey(provider, entered);
+      console.log(pc.green(`✓ Saved ${p.displayName} API key to ${getStoreName()} (${maskApiKey(entered)})\n`));
+    }
+  }
 
   if (attachments.length > 0) {
     console.log(pc.cyan(`📎 Attached ${attachments.length} file(s): ${attachments.map(a => a.name).join(', ')}\n`));

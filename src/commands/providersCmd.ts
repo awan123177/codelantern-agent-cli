@@ -2,7 +2,7 @@ import pc from 'picocolors';
 import readline from 'node:readline';
 import { ProviderRegistry } from '../provider/registry.js';
 import { loadConfig, setConfigValue } from '../config/config.js';
-import { setApiKey, getApiKey, maskApiKey } from '../security/credentials.js';
+import { setApiKey, getApiKey, maskApiKey, promptMaskedApiKey, getStoreName } from '../security/credentials.js';
 
 function promptLine(query: string, hide = false): Promise<string> {
   const rl = readline.createInterface({
@@ -47,7 +47,7 @@ export async function providersCommand(
       const nameCol = pc.bold(p.name) + activeMarker;
       const statusCol = p.isConfigured ? pc.green('✓ Ready') : pc.yellow('! Needs Key');
       const keyInfo = getApiKey(p.id);
-      const sourceCol = keyInfo.source ? pc.cyan(`[${keyInfo.source}]`) : pc.dim('(missing)');
+      const sourceCol = keyInfo.sourceDescription ? pc.cyan(`[${keyInfo.sourceDescription}]`) : pc.dim('(missing)');
 
       console.log(
         nameCol.padEnd(p.isActive ? 25 : 16) +
@@ -112,7 +112,7 @@ export async function providersCommand(
 
     const baseUrl = options?.baseUrl || await promptLine('Base URL (e.g. http://localhost:11434/v1): ');
     const defaultModel = options?.model || await promptLine('Default Model ID (e.g. llama3, qwen2.5): ');
-    const apiKey = options?.apiKey || await promptLine('API Key (optional, press Enter to skip): ');
+    const apiKey = options?.apiKey || await promptMaskedApiKey('API Key (optional, press Enter to skip)');
 
     registry.registerCustomProvider({
       id: name.toLowerCase(),

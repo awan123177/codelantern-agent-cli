@@ -7,7 +7,7 @@ import { getSessionsDir } from '../session/sessionManager.js';
 import { loadMcpConfig } from '../mcp/mcpConfig.js';
 import { loadProjectInstructions } from '../config/projectInstructions.js';
 import { ProviderRegistry } from '../provider/registry.js';
-import { listConfiguredKeys } from '../security/credentials.js';
+import { listConfiguredKeys, getStoreName } from '../security/credentials.js';
 import { SkillManager } from '../skills/skillManager.js';
 
 export async function doctorCommand(): Promise<void> {
@@ -44,6 +44,7 @@ export async function doctorCommand(): Promise<void> {
 
   console.log(`${pc.green('✓')} Active Provider:        ${pc.bold(activeProvider.displayName)} (${activeProviderId})`);
   console.log(`${pc.green('✓')} Active Model:           ${config.defaultModel}`);
+  console.log(`${pc.green('✓')} Credential Storage:     ${getStoreName()}`);
 
   const activeKeyInfo = keys[activeProviderId];
   if (!activeKeyInfo || !activeKeyInfo.configured) {
@@ -51,7 +52,7 @@ export async function doctorCommand(): Promise<void> {
     console.log(`${pc.red('✗')} API Key (${activeProviderId}):   Missing!`);
     console.log(pc.yellow(`  → To fix: set environment variable or run 'lantern keys set ${activeProviderId}'`));
   } else {
-    const src = activeKeyInfo.source ? `[${activeKeyInfo.source}]` : '';
+    const src = activeKeyInfo.sourceDescription ? `[${activeKeyInfo.sourceDescription}]` : '';
     console.log(`${pc.green('✓')} API Key (${activeProviderId}):   Found (${activeKeyInfo.maskedKey}) ${src}`);
 
     // Verify connection to active provider

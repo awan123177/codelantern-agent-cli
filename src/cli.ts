@@ -19,7 +19,7 @@ const config = loadConfig();
 program
   .name('lantern')
   .description('Code Lantern CLI — Personal AI coding assistant for the terminal with multi-provider and skills support')
-  .version('1.0.1');
+  .version('1.0.2');
 
 // Global flags
 program

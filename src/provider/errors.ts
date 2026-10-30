@@ -1,4 +1,5 @@
 import pc from 'picocolors';
+import { sanitizeSecrets } from '../security/secrets.js';
 
 export class TimeoutError extends Error {
   public timeoutMs: number;
@@ -111,7 +112,7 @@ export function formatErrorMessage(err: unknown): string {
     if (msg.includes('AbortError') || msg.includes('aborted') || msg.includes('canceled')) {
       return pc.yellow('[Request aborted]');
     }
-    return pc.red(`Error: ${msg}`);
+    return pc.red(`Error: ${sanitizeSecrets(msg)}`);
   }
-  return pc.red(`An unexpected error occurred: ${String(err)}`);
+  return pc.red(`An unexpected error occurred: ${sanitizeSecrets(String(err))}`);
 }

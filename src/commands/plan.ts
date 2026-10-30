@@ -4,6 +4,8 @@ import { createNewSession } from '../session/sessionManager.js';
 import { loadConfig } from '../config/config.js';
 import { loadAttachments } from '../provider/attachment.js';
 import { formatErrorMessage, CancelledError } from '../provider/errors.js';
+import { getApiKey, setApiKey, maskApiKey, promptMaskedApiKey, getStoreName } from '../security/credentials.js';
+import { ProviderRegistry } from '../provider/registry.js';
 import type { AgentContext } from '../types.js';
 
 export async function planCommand(
@@ -31,6 +33,18 @@ export async function planCommand(
   const attachments = loadAttachments(options.attach);
   const session = createNewSession(workspace, model, `Plan: ${task.slice(0, 40)}`);
   session.provider = provider;
+
+  const initialKeyInfo = getApiKey(provider);
+  if (!initialKeyInfo.key && process.stdin.isTTY && !jsonOutput) {
+    const p = new ProviderRegistry().getProvider(provider);
+    console.log(pc.yellow(`\n🏮 No API key configured for ${p.displayName} (${provider}).`));
+    console.log(pc.dim(`Lantern will securely store this key in your ${getStoreName()} so you only enter it once.\n`));
+    const entered = await promptMaskedApiKey(`Enter API key for '${provider}'`);
+    if (entered) {
+      setApiKey(provider, entered);
+      console.log(pc.green(`✓ Saved ${p.displayName} API key to ${getStoreName()} (${maskApiKey(entered)})\n`));
+    }
+  }
 
   if (!jsonOutput) {
     console.log(pc.bold(pc.yellow('\n🏮 Code Lantern Plan Mode (Read-Only)')));

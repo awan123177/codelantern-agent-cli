@@ -2,7 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import readline from 'node:readline';
 import { getLanternHomeDir } from '../config/config.js';
+import { NativeCredentialStore } from './nativeStore.js';
+
+export const SERVICE_NAME = 'codelantern';
 
 const PROVIDER_ENV_VARS: Record<string, string[]> = {
   gemini: ['GEMINI_API_KEY', 'GOOGLE_API_KEY'],
@@ -12,14 +16,21 @@ const PROVIDER_ENV_VARS: Record<string, string[]> = {
   custom: ['CUSTOM_API_KEY', 'OPENAI_API_KEY']
 };
 
-function getCredentialsFilePath(): string {
+export function getLegacyCredentialsFilePath(): string {
   return path.join(getLanternHomeDir(), 'credentials.json');
 }
 
 /**
- * Derives a machine-unique 256-bit encryption key
+ * Returns user-friendly name of the active OS credential store
  */
-function getMachineDerivedKey(): Buffer {
+export function getStoreName(): string {
+  return NativeCredentialStore.getInstance().getStoreName();
+}
+
+/**
+ * Derives a machine-unique 256-bit encryption key (used for legacy decryption/migration)
+ */
+function getLegacyMachineKey(): Buffer {
   const salt = `codelantern_${os.hostname()}_${os.userInfo().username}`;
   const secret = `${os.homedir()}_${process.platform}_${os.arch()}`;
   return crypto.scryptSync(secret, salt, 32);
@@ -27,7 +38,7 @@ function getMachineDerivedKey(): Buffer {
 
 export function encryptSecret(plainText: string): string {
   const iv = crypto.randomBytes(12);
-  const key = getMachineDerivedKey();
+  const key = getLegacyMachineKey();
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
 
   let encrypted = cipher.update(plainText, 'utf8', 'hex');
@@ -45,7 +56,7 @@ export function decryptSecret(encryptedPayload: string): string | null {
     const [ivHex, authTagHex, encryptedHex] = parts;
     const iv = Buffer.from(ivHex, 'hex');
     const authTag = Buffer.from(authTagHex, 'hex');
-    const key = getMachineDerivedKey();
+    const key = getLegacyMachineKey();
 
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
     decipher.setAuthTag(authTag);
@@ -65,99 +76,291 @@ export function maskApiKey(key: string): string {
   return `${clean.slice(0, 4)}...${clean.slice(-4)}`;
 }
 
-export function getApiKey(provider: string): { key: string | null; source?: 'env' | 'store' } {
+export interface KeyResult {
+  key: string | null;
+  source?: 'env' | 'store';
+  sourceDescription?: string;
+}
+
+export interface MigrationReport {
+  attempted: boolean;
+  migratedProviders: string[];
+  failedProviders: string[];
+}
+
+let migrationPerformed = false;
+
+/**
+ * Automatically migrates existing credentials from legacy ~/.codelantern/credentials.json
+ * into the native OS credential store (Keychain on macOS, Windows Credential Manager on Windows).
+ * Verifies each key's retrieval before removing from the legacy vault to ensure crash safety.
+ */
+export function migrateLegacyCredentials(force = false): MigrationReport {
+  if (migrationPerformed && !force) {
+    return { attempted: false, migratedProviders: [], failedProviders: [] };
+  }
+  migrationPerformed = true;
+
+  const legacyPath = getLegacyCredentialsFilePath();
+  if (!fs.existsSync(legacyPath)) {
+    return { attempted: false, migratedProviders: [], failedProviders: [] };
+  }
+
+  const store = NativeCredentialStore.getInstance();
+  if (!store.isAvailable()) {
+    return { attempted: false, migratedProviders: [], failedProviders: [] };
+  }
+
+  let legacyData: Record<string, string> = {};
+  try {
+    const raw = fs.readFileSync(legacyPath, 'utf8');
+    legacyData = JSON.parse(raw);
+  } catch {
+    return { attempted: true, migratedProviders: [], failedProviders: [] };
+  }
+
+  const providers = Object.keys(legacyData);
+  if (providers.length === 0) {
+    try { fs.rmSync(legacyPath, { force: true }); } catch {}
+    return { attempted: true, migratedProviders: [], failedProviders: [] };
+  }
+
+  const migratedProviders: string[] = [];
+  const failedProviders: string[] = [];
+
+  for (const provider of providers) {
+    const encrypted = legacyData[provider];
+    if (!encrypted) continue;
+
+    const decryptedKey = decryptSecret(encrypted);
+    if (!decryptedKey || decryptedKey.trim().length === 0) {
+      failedProviders.push(provider);
+      continue;
+    }
+
+    // 1. Save into OS credential store
+    const saved = store.set(SERVICE_NAME, provider.toLowerCase(), decryptedKey.trim());
+    if (!saved) {
+      failedProviders.push(provider);
+      continue;
+    }
+
+    // 2. Verify retrieval from OS credential store before removing legacy copy
+    const verified = store.get(SERVICE_NAME, provider.toLowerCase());
+    if (verified !== decryptedKey.trim()) {
+      failedProviders.push(provider);
+      continue;
+    }
+
+    // 3. Successfully verified in OS store: remove from legacy vault
+    migratedProviders.push(provider);
+    delete legacyData[provider];
+
+    // Persist removal immediately so partial migration is crash-safe
+    try {
+      fs.writeFileSync(legacyPath, JSON.stringify(legacyData, null, 2), {
+        encoding: 'utf8',
+        mode: 0o600
+      });
+    } catch {
+      // ignore write error
+    }
+  }
+
+  // If all keys have been successfully migrated, safely clean up legacy file
+  if (Object.keys(legacyData).length === 0) {
+    try {
+      fs.rmSync(legacyPath, { force: true });
+    } catch {
+      // ignore
+    }
+  }
+
+  return {
+    attempted: true,
+    migratedProviders,
+    failedProviders
+  };
+}
+
+/**
+ * Retrieves the API key for a given provider with explicit precedence:
+ * 1. Environment variables (GEMINI_API_KEY, etc.)
+ * 2. Native OS credential store (macOS Keychain, Windows Credential Manager)
+ */
+export function getApiKey(provider: string): KeyResult {
   const norm = provider.toLowerCase();
 
-  // 1. Check environment variables first
+  // 1. Check environment variables first (explicit override)
   const envVarNames = PROVIDER_ENV_VARS[norm] || [`${norm.toUpperCase()}_API_KEY`];
   for (const envVar of envVarNames) {
     const val = process.env[envVar];
     if (val && val.trim().length > 0) {
-      return { key: val.trim(), source: 'env' };
+      return {
+        key: val.trim(),
+        source: 'env',
+        sourceDescription: `env: ${envVar}`
+      };
     }
   }
 
-  // 2. Check encrypted store
-  const filePath = getCredentialsFilePath();
-  if (fs.existsSync(filePath)) {
-    try {
-      const raw = fs.readFileSync(filePath, 'utf8');
-      const data = JSON.parse(raw);
-      if (data[norm]) {
-        const decrypted = decryptSecret(data[norm]);
-        if (decrypted) {
-          return { key: decrypted, source: 'store' };
-        }
-      }
-    } catch {
-      // Ignore read errors
-    }
+  // 2. Run legacy migration if needed
+  migrateLegacyCredentials();
+
+  // 3. Query native OS credential store
+  const store = NativeCredentialStore.getInstance();
+  const storedKey = store.get(SERVICE_NAME, norm);
+  if (storedKey && storedKey.trim().length > 0) {
+    return {
+      key: storedKey.trim(),
+      source: 'store',
+      sourceDescription: store.getStoreName()
+    };
   }
 
   return { key: null };
 }
 
+/**
+ * Securely saves an API key to the native OS credential store.
+ * Verifies that the saved key can be retrieved before returning.
+ */
 export function setApiKey(provider: string, apiKey: string): void {
   const norm = provider.toLowerCase();
-  const filePath = getCredentialsFilePath();
-  let data: Record<string, string> = {};
+  const cleanKey = apiKey.trim();
 
-  if (fs.existsSync(filePath)) {
-    try {
-      const raw = fs.readFileSync(filePath, 'utf8');
-      data = JSON.parse(raw);
-    } catch {
-      data = {};
-    }
+  if (!cleanKey) {
+    throw new Error('API key cannot be empty.');
   }
 
-  data[norm] = encryptSecret(apiKey.trim());
+  const store = NativeCredentialStore.getInstance();
+  if (!store.isAvailable()) {
+    throw new Error(
+      `Secure OS credential store (${store.getStoreName()}) is unavailable on this system.\n` +
+      `Please set your key using an environment variable:\n` +
+      `  export ${norm.toUpperCase()}_API_KEY="your-api-key"`
+    );
+  }
 
-  try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), {
-      encoding: 'utf8',
-      mode: 0o600
-    });
-  } catch (err: any) {
-    console.error(`Warning: Failed to save credentials: ${err.message}`);
+  const ok = store.set(SERVICE_NAME, norm, cleanKey);
+  if (!ok) {
+    throw new Error(`Failed to write API key for '${provider}' to ${store.getStoreName()}.`);
+  }
+
+  // Verify retrieval immediately
+  const check = store.get(SERVICE_NAME, norm);
+  if (check !== cleanKey) {
+    throw new Error(`Verification error: Stored key for '${provider}' could not be read back from ${store.getStoreName()}.`);
   }
 }
 
+/**
+ * Removes an API key from the native OS credential store.
+ */
 export function removeApiKey(provider: string): boolean {
   const norm = provider.toLowerCase();
-  const filePath = getCredentialsFilePath();
-  if (!fs.existsSync(filePath)) return false;
+  const store = NativeCredentialStore.getInstance();
+  const deletedFromStore = store.delete(SERVICE_NAME, norm);
 
-  try {
-    const raw = fs.readFileSync(filePath, 'utf8');
-    const data = JSON.parse(raw);
-    if (data[norm]) {
-      delete data[norm];
-      fs.writeFileSync(filePath, JSON.stringify(data, null, 2), {
-        encoding: 'utf8',
-        mode: 0o600
-      });
-      return true;
+  // Also ensure removal from legacy file if it still exists
+  const legacyPath = getLegacyCredentialsFilePath();
+  if (fs.existsSync(legacyPath)) {
+    try {
+      const raw = fs.readFileSync(legacyPath, 'utf8');
+      const data = JSON.parse(raw);
+      if (data[norm]) {
+        delete data[norm];
+        fs.writeFileSync(legacyPath, JSON.stringify(data, null, 2), {
+          encoding: 'utf8',
+          mode: 0o600
+        });
+      }
+    } catch {
+      // ignore
     }
-  } catch {
-    // ignore
   }
 
-  return false;
+  return deletedFromStore;
 }
 
-export function listConfiguredKeys(): Record<string, { configured: boolean; source?: 'env' | 'store'; maskedKey: string }> {
+export interface ConfiguredKeyInfo {
+  configured: boolean;
+  source?: 'env' | 'store';
+  sourceDescription: string;
+  maskedKey: string;
+}
+
+/**
+ * Lists all configured provider keys, indicating source and masked representation.
+ * Never exposes plaintext keys.
+ */
+export function listConfiguredKeys(): Record<string, ConfiguredKeyInfo> {
+  migrateLegacyCredentials();
   const providers = ['gemini', 'openai', 'anthropic', 'openrouter', 'custom'];
-  const result: Record<string, { configured: boolean; source?: 'env' | 'store'; maskedKey: string }> = {};
+  const result: Record<string, ConfiguredKeyInfo> = {};
 
   for (const p of providers) {
-    const { key, source } = getApiKey(p);
+    const { key, source, sourceDescription } = getApiKey(p);
     result[p] = {
       configured: Boolean(key),
       source,
+      sourceDescription: sourceDescription ? `[${sourceDescription}]` : 'none',
       maskedKey: key ? maskApiKey(key) : '(not configured)'
     };
   }
 
   return result;
+}
+
+/**
+ * Prompts the user interactively with a masked prompt ('*').
+ * Keystrokes are not echoed in plaintext to the terminal.
+ */
+export async function promptMaskedApiKey(query: string): Promise<string> {
+  const promptText = query.endsWith(': ') ? query : `${query}: `;
+
+  if (!process.stdin.isTTY || !process.stdin.setRawMode) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    return new Promise((resolve) => {
+      rl.question(promptText, (ans) => {
+        rl.close();
+        resolve(ans.trim());
+      });
+    });
+  }
+
+  return new Promise((resolve) => {
+    process.stdout.write(promptText);
+    const wasRaw = process.stdin.isRaw;
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
+
+    let key = '';
+    const onData = (chunk: string) => {
+      for (const char of chunk) {
+        if (char === '\u0003') { // Ctrl+C
+          process.stdin.setRawMode(wasRaw ?? false);
+          process.stdin.removeListener('data', onData);
+          process.stdout.write('\n');
+          process.exit(130);
+        } else if (char === '\r' || char === '\n') {
+          process.stdin.setRawMode(wasRaw ?? false);
+          process.stdin.removeListener('data', onData);
+          process.stdout.write('\n');
+          resolve(key.trim());
+          return;
+        } else if (char === '\u0008' || char === '\u007f') { // Backspace
+          if (key.length > 0) {
+            key = key.slice(0, -1);
+            process.stdout.write('\b \b');
+          }
+        } else if (char >= ' ') {
+          key += char;
+          process.stdout.write('*');
+        }
+      }
+    };
+    process.stdin.on('data', onData);
+  });
 }

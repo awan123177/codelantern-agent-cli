@@ -3,7 +3,7 @@ import { listSessions, exportSessionMarkdown } from '../session/sessionManager.j
 import { ProviderRegistry } from '../provider/registry.js';
 import { SkillManager } from '../skills/skillManager.js';
 import { loadConfig, setConfigValue } from '../config/config.js';
-import { getApiKey } from '../security/credentials.js';
+import { getApiKey, setApiKey, maskApiKey, promptMaskedApiKey, getStoreName } from '../security/credentials.js';
 import { classifyModel, getRecommendedCodingModels } from '../provider/modelClassifier.js';
 import type { OrbitSession, ProviderModelInfo } from '../types.js';
 
@@ -96,12 +96,15 @@ export async function handleSlashCommand(input: string, context: SlashCommandCon
 
         const p = registry.getProvider(norm);
         if (!p.isConfigured()) {
-          console.log('\n' + pc.yellow(`⚠️ Provider '${p.displayName}' has no API key configured.`));
-          console.log(pc.dim('To configure this provider:'));
-          console.log(pc.dim(`  • In shell: export ${norm.toUpperCase()}_API_KEY="your-api-key"`));
-          console.log(pc.dim(`  • Or run:   lantern keys set ${norm}`));
-          console.log(pc.dim('  (API keys are encrypted locally using AES-256-GCM)\n'));
-          return;
+          console.log('\n' + pc.yellow(`🏮 No API key configured for ${p.displayName} (${norm}).`));
+          console.log(pc.dim(`Lantern will securely save this key to your ${getStoreName()} so you never have to re-enter it.`));
+          const key = await promptMaskedApiKey(`Enter API key for '${norm}' (or press Enter to cancel)`);
+          if (!key) {
+            console.log(pc.dim('Provider switch cancelled.\n'));
+            return;
+          }
+          setApiKey(norm, key);
+          console.log(pc.green(`✓ Saved key for '${p.displayName}' to ${getStoreName()} (${maskApiKey(key)})\n`));
         }
 
         // Connection verification check
@@ -166,7 +169,7 @@ export async function handleSlashCommand(input: string, context: SlashCommandCon
         const statusCol = p.isConfigured ? pc.green('✓ Ready').padEnd(18) : pc.yellow('! Needs Key').padEnd(18);
         const modelCol = pc.cyan(p.defaultModel).padEnd(30);
         const keyInfo = getApiKey(p.id);
-        const srcCol = keyInfo.source ? pc.cyan(`[${keyInfo.source}]`) : pc.dim('(missing)');
+        const srcCol = keyInfo.sourceDescription ? pc.cyan(`[${keyInfo.sourceDescription}]`) : pc.dim('(missing)');
 
         console.log(`${num}${nameCol}${statusCol}${modelCol}${srcCol}`);
       }
@@ -251,6 +254,16 @@ export async function handleSlashCommand(input: string, context: SlashCommandCon
       }
 
       // No arguments: discover models for active provider
+      if (!p.isConfigured()) {
+        console.log('\n' + pc.yellow(`🏮 No API key configured for ${p.displayName} (${p.id}).`));
+        console.log(pc.dim(`Lantern will securely save this key to your ${getStoreName()} so you won't need to enter it again.`));
+        const key = await promptMaskedApiKey(`Enter API key for '${p.id}' (or press Enter to cancel)`);
+        if (key) {
+          setApiKey(p.id, key);
+          console.log(pc.green(`✓ Saved key for '${p.displayName}' to ${getStoreName()} (${maskApiKey(key)})\n`));
+        }
+      }
+
       console.log(pc.dim(`\nDiscovering available models for ${p.displayName}...`));
       let models: ProviderModelInfo[] = [];
       let discoveryError: string | null = null;
