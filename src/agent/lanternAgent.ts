@@ -212,27 +212,28 @@ export class LanternAgent {
           lowLatency: context.lowLatency,
           callbacks: {
             onStateChange: (state: string) => {
-              if (state === 'connecting') {
+              if (state === 'resolving_credentials') {
+                this.spinner.resolvingCredentials(provider.displayName);
+              } else if (state === 'connecting') {
                 this.spinner.connecting(provider.displayName, context.model);
               } else if (state === 'waiting_first_token') {
                 this.spinner.waitingFirstToken(provider.displayName, context.model);
               } else if (state.startsWith('retrying:')) {
                 const attempt = state.split(':')[1];
                 this.spinner.retrying(parseInt(attempt, 10), 3, 1500);
-              } else if (state === 'streaming') {
+              } else if (state === 'streaming' || state === 'receiving') {
                 this.spinner.stop();
               }
             },
             onChunk: (chunk: string) => {
-              if (currentStepText === '') {
-                this.spinner.stop();
-              }
+              this.spinner.stop();
               currentStepText += chunk;
               if (!context.jsonOutput) {
                 process.stdout.write(chunk);
               }
             },
             onToolCalls: (calls: ToolCallItem[]) => {
+              this.spinner.stop();
               currentToolCalls = calls;
             },
             onUsage: (usage: TokenUsage) => {

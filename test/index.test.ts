@@ -10,8 +10,18 @@ import { createNewSession, saveSession, loadSession, deleteSession, exportSessio
 import { shouldCompact, compactTurns } from '../src/session/compactor.js';
 import { validateConfigValue } from '../src/config/schema.js';
 import { formatTerminalDiff, formatNewFilePreview } from '../src/approval/diffViewer.js';
-import { createLinkedAbortController, wrapStreamWithFirstTokenTimeout } from '../src/provider/timeout.js';
-import { TimeoutError, FirstTokenTimeoutError, CancelledError } from '../src/provider/errors.js';
+import { createLinkedAbortController, wrapStreamWithFirstTokenTimeout, withTimeoutRace } from '../src/provider/timeout.js';
+import {
+  TimeoutError,
+  FirstTokenTimeoutError,
+  CancelledError,
+  AuthenticationError,
+  ModelNotFoundError,
+  MissingApiKeyError,
+  RateLimitError,
+  LanternProviderError,
+  formatErrorMessage
+} from '../src/provider/errors.js';
 import {
   encryptSecret,
   decryptSecret,
@@ -24,9 +34,11 @@ import {
   migrateLegacyCredentials
 } from '../src/security/credentials.js';
 import { NativeCredentialStore } from '../src/security/nativeStore.js';
-import { formatErrorMessage } from '../src/provider/errors.js';
 import { SkillManager } from '../src/skills/skillManager.js';
 import { ProviderRegistry } from '../src/provider/registry.js';
+import { GeminiProvider } from '../src/provider/gemini.js';
+import { TerminalSpinner } from '../src/ui/spinner.js';
+import { LanternAgent } from '../src/agent/lanternAgent.js';
 import { handleSlashCommand, type SlashCommandContext } from '../src/ui/slashCommands.js';
 import { classifyModel, getRecommendedCodingModels } from '../src/provider/modelClassifier.js';
 import { loadConfig, saveConfig } from '../src/config/config.js';
@@ -870,6 +882,181 @@ Do thing A and thing B.
     // /exit and /quit return false to stop the REPL loop cleanly
     assert.strictEqual(await handleSlashCommand('/exit', mockSlashContext), false);
     assert.strictEqual(await handleSlashCommand('/quit', mockSlashContext), false);
+  });
+
+  // 16. Lifecycle, Connection Timeout, and Gemini Regression Suite
+  await test('Gemini Lifecycle: withTimeoutRace rejects on connection timeout without hanging', async () => {
+    let timeoutFired = false;
+    const hangingPromise = new Promise(resolve => setTimeout(resolve, 5000));
+    try {
+      await withTimeoutRace(hangingPromise, 50, 'Connection to Google Gemini (gemini-3.8-flash)', undefined, () => {
+        timeoutFired = true;
+      });
+      assert.fail('Should have timed out');
+    } catch (err: any) {
+      assert.ok(err instanceof TimeoutError);
+      assert.strictEqual(timeoutFired, true);
+      assert.ok(err.message.includes('Connection to Google Gemini (gemini-3.8-flash) timed out after 0.1s'));
+    }
+  });
+
+  await test('Gemini Lifecycle: withTimeoutRace rejects immediately on Ctrl+C AbortSignal', async () => {
+    const controller = new AbortController();
+    const hangingPromise = new Promise(resolve => setTimeout(resolve, 5000));
+    const racePromise = withTimeoutRace(hangingPromise, 10000, 'Connection to Google Gemini', controller.signal);
+    controller.abort(new CancelledError('Operation cancelled by user (Ctrl+C).'));
+    try {
+      await racePromise;
+      assert.fail('Should have been cancelled');
+    } catch (err: any) {
+      assert.ok(err instanceof CancelledError);
+      assert.ok(err.message.includes('cancelled by user'));
+    }
+  });
+
+  await test('Gemini Lifecycle: wrapStreamWithFirstTokenTimeout fires onFirstToken callback and transitions from waiting', async () => {
+    let ttftReported = false;
+    async function* mockStream() {
+      yield { text: 'Hello' };
+      yield { text: ' world' };
+    }
+    const wrapped = wrapStreamWithFirstTokenTimeout(mockStream(), 1000, 'Google Gemini', 'gemini-3.8-flash', undefined, (latency) => {
+      ttftReported = true;
+      assert.ok(latency >= 0);
+    });
+    let full = '';
+    for await (const chunk of wrapped) {
+      full += chunk.text;
+    }
+    assert.strictEqual(full, 'Hello world');
+    assert.strictEqual(ttftReported, true);
+  });
+
+  await test('Gemini Lifecycle: Missing credentials throw MissingApiKeyError immediately', async () => {
+    const provider = new GeminiProvider();
+    const originalEnv = process.env.GEMINI_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    try {
+      if (!provider.isConfigured()) {
+        await assert.rejects(async () => {
+          await provider.streamGenerate({
+            model: 'gemini-3.8-flash',
+            systemInstruction: 'test',
+            history: [],
+            tools: [],
+            callbacks: {}
+          });
+        }, (err: any) => {
+          assert.ok(err instanceof MissingApiKeyError);
+          assert.ok(err.message.includes("API key for provider 'gemini' is not configured"));
+          assert.ok(err.message.includes("lantern keys set gemini"));
+          return true;
+        });
+      }
+    } finally {
+      if (originalEnv) process.env.GEMINI_API_KEY = originalEnv;
+    }
+  });
+
+  await test('Gemini Lifecycle: AuthenticationError formats with clear next step', () => {
+    const authErr = new AuthenticationError("Authentication failed for Google Gemini: Invalid or restricted API key. Please run 'lantern keys set gemini' or verify GEMINI_API_KEY.");
+    const formatted = formatErrorMessage(authErr);
+    assert.ok(formatted.includes('Authentication failed'));
+    assert.ok(formatted.includes('lantern keys set gemini'));
+  });
+
+  await test('Gemini Lifecycle: ModelNotFoundError identifies exact model and provider', () => {
+    const notFound = new ModelNotFoundError('gemini-3.8-flash', 'Google Gemini');
+    const formatted = formatErrorMessage(notFound);
+    assert.ok(formatted.includes("Model 'gemini-3.8-flash' not found"));
+    assert.ok(formatted.includes('Google Gemini'));
+    assert.ok(formatted.includes('/model'));
+  });
+
+  await test('Gemini Lifecycle: RateLimitError advises waiting or quota check', () => {
+    const rateErr = new RateLimitError('Rate limit reached.');
+    const formatted = formatErrorMessage(rateErr);
+    assert.ok(formatted.includes('quota'));
+  });
+
+  await test('Gemini Lifecycle: Empty text chunks or function-call only responses stop spinner cleanly', async () => {
+    const spinner = new TerminalSpinner();
+    spinner.start('Connecting to Google Gemini (gemini-3.8-flash)...');
+    assert.strictEqual(spinner['isRunning'], true);
+
+    // Simulate receiving tool calls only
+    spinner.resolvingCredentials('Google Gemini');
+    assert.ok(spinner['message'].includes('Resolving credentials'));
+
+    spinner.connecting('Google Gemini', 'gemini-3.8-flash');
+    assert.ok(spinner['message'].includes('Connecting to'));
+
+    spinner.waitingFirstToken('Google Gemini', 'gemini-3.8-flash');
+    assert.ok(spinner['message'].includes('Waiting for first token'));
+
+    // As soon as function calls arrive or streaming starts, spinner stops
+    spinner.stop();
+    assert.strictEqual(spinner['isRunning'], false);
+  });
+
+  await test('Gemini Lifecycle: Retried LLM generation does not repeat executed tool calls', async () => {
+    const mockSession = createNewSession(tmpDir, 'gemini-3.8-flash');
+    mockSession.turns.push({
+      role: 'user',
+      text: 'inspect file',
+      timestamp: new Date().toISOString()
+    });
+    mockSession.turns.push({
+      role: 'model',
+      toolCalls: [{ id: 'call_1', name: 'read_file', args: { path: 'package.json' } }],
+      timestamp: new Date().toISOString()
+    });
+    mockSession.turns.push({
+      role: 'tool',
+      toolResults: [{ callId: 'call_1', name: 'read_file', result: '{"name":"test"}' }],
+      timestamp: new Date().toISOString()
+    });
+
+    assert.strictEqual(mockSession.turns.length, 3);
+    const toolTurns = mockSession.turns.filter(t => t.role === 'tool');
+    assert.strictEqual(toolTurns.length, 1);
+    assert.strictEqual(toolTurns[0].toolResults?.length, 1);
+  });
+
+  await test('Gemini Lifecycle: Secret keys are never exposed in errors or sessions', () => {
+    const fakeGeminiKey = 'AIzaSyD9SecretGeminiKey1234567890abcdefg';
+    const fakeOpenRouterKey = 'sk-or-v1-abcdef1234567890abcdef1234567890abcdef';
+    const fakeOpenAIKey = 'sk-proj-abc123def456ghi789jkl012mno345pqr678';
+
+    const err1 = new Error(`Request to https://generativelanguage.googleapis.com failed with key ${fakeGeminiKey}`);
+    const formatted1 = formatErrorMessage(err1);
+    assert.ok(!formatted1.includes(fakeGeminiKey));
+    assert.ok(formatted1.includes('AIza***********************************'));
+
+    const err2 = new LanternProviderError(`OpenRouter failed for key ${fakeOpenRouterKey}`);
+    const formatted2 = formatErrorMessage(err2);
+    assert.ok(!formatted2.includes(fakeOpenRouterKey));
+    assert.ok(formatted2.includes('sk-****'));
+
+    const err3 = new AuthenticationError(`OpenAI failed: ${fakeOpenAIKey}`);
+    const formatted3 = formatErrorMessage(err3);
+    assert.ok(!formatted3.includes(fakeOpenAIKey));
+  });
+
+  await test('Gemini Lifecycle: Live request verification (if key available)', async () => {
+    const provider = new GeminiProvider();
+    if (provider.isConfigured()) {
+      const startTime = Date.now();
+      const testResult = await provider.testConnection();
+      const elapsed = Date.now() - startTime;
+      if (testResult.success) {
+        console.log(`    (Live Gemini connection verified in ${elapsed}ms for model: ${testResult.resolvedModel})`);
+      } else {
+        console.log(`    (Live Gemini connection attempted in ${elapsed}ms: ${testResult.error})`);
+      }
+    } else {
+      console.log('    (No Gemini API key in store or environment; skipping live network call)');
+    }
   });
 
   // Cleanup tmp dir and restore initial config

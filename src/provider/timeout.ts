@@ -38,6 +38,56 @@ export function createLinkedAbortController(parentSignal?: AbortSignal, timeoutM
   return { controller, cleanup };
 }
 
+/**
+ * Race a promise against a timeout duration and optional AbortSignal.
+ * Cleans up timer and listeners unconditionally in finally.
+ */
+export async function withTimeoutRace<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  operationName: string,
+  signal?: AbortSignal,
+  onTimeout?: () => void
+): Promise<T> {
+  if (signal?.aborted) {
+    throw signal.reason || new CancelledError();
+  }
+
+  let timer: NodeJS.Timeout | null = null;
+  let abortListener: (() => void) | null = null;
+
+  try {
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        if (onTimeout) {
+          try {
+            onTimeout();
+          } catch {}
+        }
+        reject(new TimeoutError(timeoutMs, operationName));
+      }, timeoutMs);
+
+      if (signal) {
+        abortListener = () => {
+          if (timer) clearTimeout(timer);
+          reject(signal.reason || new CancelledError());
+        };
+        signal.addEventListener('abort', abortListener, { once: true });
+      }
+    });
+
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (signal && abortListener) {
+      signal.removeEventListener('abort', abortListener);
+    }
+  }
+}
+
 export async function* wrapStreamWithFirstTokenTimeout<T>(
   stream: AsyncIterable<T>,
   firstTokenTimeoutMs: number,
@@ -49,12 +99,10 @@ export async function* wrapStreamWithFirstTokenTimeout<T>(
   let firstTokenReceived = false;
   const startTime = Date.now();
   let timer: NodeJS.Timeout | null = null;
-  let timedOut = false;
 
   const timerPromise = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       if (!firstTokenReceived) {
-        timedOut = true;
         reject(new FirstTokenTimeoutError(firstTokenTimeoutMs, provider, model));
       }
     }, firstTokenTimeoutMs);
@@ -89,6 +137,9 @@ export async function* wrapStreamWithFirstTokenTimeout<T>(
         }
 
         if (result.done) {
+          if (onFirstToken) {
+            onFirstToken(Date.now() - startTime);
+          }
           break;
         }
 

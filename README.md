@@ -12,6 +12,19 @@ Code Lantern CLI is a resilient, autonomous terminal coding assistant designed t
 
 ## ⚡ What's New in v1.0.2
 
+- 🚀 **Connection & Request Lifecycle Resilience (Google Gemini Hang Resolution)**:
+  - **Identified Root Cause**: In `@google/genai`, the client uses an internal Undici dispatcher configured with disabled header/body timeouts (`headersTimeout: 0, bodyTimeout: 0`). The previous implementation did not pass `abortSignal` or `httpOptions.timeout` to `client.models.generateContentStream`, nor did it bound the connection promise. Any stalled socket, proxy delay, or handshake freeze caused the application to await `generateContentStream` indefinitely while the spinner remained frozen at `Connecting to Google Gemini (gemini-3.8-flash)...`.
+  - **End-to-End Signal & Timeout Propagation**: Propagates a unified abort signal through credential resolution, provider initialization, network connection, streaming token consumption, and tool execution.
+  - **Bounded Connection Setup**: Introduces `connectTimeoutMs` (default: 15s or bounded by `timeoutMs`) using provider-level `withTimeoutRace` so that connection stalls or socket hangs abort promptly and cleanly.
+  - **Real Progress Stages**: Real-time spinner dynamically transitions through:
+    - `Resolving credentials for <provider>...`
+    - `Connecting to <provider> (<model>)...`
+    - `Waiting for first token from <provider> (<model>)...`
+    - `Receiving streaming response...`
+    - `Executing tool <name>...`
+  - **Zero Stuck Spinners**: Empty text chunks or function-call-only responses unconditionally stop the spinner immediately upon arrival.
+  - **Actionable Diagnostics**: Clear, specific error formatting for timeouts, cancellations, 401/403 authentication failures, 404 model access issues, and 429 rate limits without leaking API keys.
+  - **Safe Retries**: Only safe transient network errors (503, connection resets) retry with capped exponential backoff. Previously executed tool operations are never repeated.
 - 🔐 **Persistent Native OS Credential Storage & Automatic Reuse**:
   - **Native OS Stores**: Keys are securely saved directly into your operating system's native credential vault:
     - **macOS**: Apple Keychain via native Keychain Services.
@@ -358,12 +371,47 @@ Example output:
 
 ---
 
+## 🔧 Troubleshooting Google Gemini Connectivity
+
+If you ever encounter connection difficulties, follow these steps:
+
+1. **Verify Configured API Key**:
+   Run `lantern keys list` to ensure `gemini` is configured via your native OS credential store or environment:
+   ```bash
+   lantern keys list
+   ```
+   If unconfigured, store your key once:
+   ```bash
+   lantern keys set gemini
+   ```
+2. **Test Provider Connection**:
+   Test direct connectivity, authorization, and token latency:
+   ```bash
+   lantern keys test gemini
+   # or:
+   lantern providers test gemini
+   ```
+3. **Switch Model if Needed**:
+   If a particular model is unavailable or restricted on your account:
+   - Inside interactive session: type `/model` to browse models, or `/model gemini-2.5-flash` to switch immediately.
+   - From shell: `lantern models set gemini-2.5-flash`
+4. **Adjust Timeout Limits**:
+   If your network has high latency or is behind a strict proxy, increase the timeout limits:
+   ```bash
+   lantern config set timeoutMs 120000
+   lantern config set firstTokenTimeoutMs 45000
+   ```
+5. **Instant Cancellation**:
+   Pressing **Ctrl+C** at any time during credential resolution, connection setup, first-token waiting, streaming, or tool execution immediately stops the request and cleanly returns to your prompt.
+
+---
+
 ## 🧪 Automated Testing
 
-Code Lantern includes a comprehensive test suite covering security sandboxing, CRLF line endings, tool execution, session persistence, timeout handling, first-token limits, cancellation, OS credential storage, automatic key reuse, provider isolation, env var overrides, crash-safe migration, secret redaction, in-session switching, and slash commands:
+Code Lantern includes a comprehensive test suite covering security sandboxing, CRLF line endings, tool execution, session persistence, timeout handling, first-token limits, cancellation, OS credential storage, automatic key reuse, provider isolation, env var overrides, crash-safe migration, secret redaction, in-session switching, slash commands, and the Gemini request lifecycle:
 
 ```bash
-# Run test suite (50 automated checks)
+# Run test suite (61 automated checks)
 npm test
 
 # Run TypeScript type check
@@ -377,7 +425,7 @@ npm run build
 
 ## ⚠️ Platform Verification Notes
 
-- **macOS (Directly Verified)**: Developed, built, and verified on macOS (Apple Silicon arm64, Node v26) with all 50 automated tests passing, native macOS Keychain integration verified, and live provider connectivity verified.
+- **macOS (Directly Verified)**: Developed, built, and verified on macOS (Apple Silicon arm64, Node v26) with all 61 automated tests passing, native macOS Keychain integration verified, and live provider connectivity verified.
 - **Windows (Architecturally Supported)**: Built with portable Node.js APIs (`path.normalize`, `path.sep`, `windowsHide: true`, CRLF handling, Windows Credential Manager integration, and Windows command guards). Direct testing on native Windows hardware was not performed in this session; Windows verification relies on the automated Windows CI workflow (`.github/workflows/ci.yml`).
 
 ---

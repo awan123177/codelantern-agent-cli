@@ -81,29 +81,38 @@ export class LanternProviderError extends Error {
 
 export function formatErrorMessage(err: unknown): string {
   if (err instanceof CancelledError) {
-    return pc.yellow(`\n[Cancelled] ${err.message}`);
+    return pc.yellow(`\n[Cancelled] ${sanitizeSecrets(err.message)}`);
   }
   if (err instanceof FirstTokenTimeoutError) {
-    return pc.red(`\n⏱️ ${err.message}\n` + pc.yellow(`  Tip: Check your network connection or try lowering temperature or setting a faster model with 'lantern model set <id>'.`));
+    return (
+      pc.red(`\n⏱️ ${sanitizeSecrets(err.message)}\n`) +
+      pc.yellow(`  Tip: Check your network connection or try switching to a faster model with '/model' or 'lantern model set <id>'.`)
+    );
   }
   if (err instanceof TimeoutError) {
-    return pc.red(`\n⏱️ ${err.message}\n` + pc.yellow(`  Tip: You can increase the timeout limit using 'lantern config set timeoutMs 120000'.`));
+    return (
+      pc.red(`\n⏱️ ${sanitizeSecrets(err.message)}\n`) +
+      pc.yellow(`  Tip: Check your network connection. You can increase the timeout limit using 'lantern config set timeoutMs 120000' or test provider connectivity with 'lantern providers test'.`)
+    );
   }
   if (err instanceof MissingApiKeyError) {
-    return pc.red(`\n${err.message}`);
+    return pc.red(`\n${sanitizeSecrets(err.message)}`);
   }
   if (err instanceof RateLimitError) {
-    return pc.yellow(`\n⚠️ ${err.message}`);
+    return pc.yellow(`\n⚠️ ${sanitizeSecrets(err.message)}`);
   }
   if (err instanceof AuthenticationError) {
-    return pc.red(`\n🔒 ${err.message}`);
+    return pc.red(`\n🔒 ${sanitizeSecrets(err.message)}`);
   }
   if (err instanceof ModelNotFoundError) {
-    return pc.red(`\n🔍 ${err.message}\n` + pc.dim(`Run 'lantern models list' to view available models for your account.`));
+    return (
+      pc.red(`\n🔍 ${sanitizeSecrets(err.message)}\n`) +
+      pc.yellow(`  Tip: Run '/model' inside Lantern or 'lantern models list' to view and select available models for your account.`)
+    );
   }
   if (err instanceof Error) {
-    const msg = err.message || '';
-    if (msg.includes('API_KEY_INVALID') || msg.includes('401') || msg.includes('Incorrect API key')) {
+    const msg = sanitizeSecrets(err.message || '');
+    if (msg.includes('API_KEY_INVALID') || msg.includes('401') || msg.includes('Incorrect API key') || msg.includes('API key not valid')) {
       return pc.red(`Authentication failed: Invalid API key. Update it with 'lantern keys set <provider>'.`);
     }
     if (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429')) {
@@ -112,7 +121,7 @@ export function formatErrorMessage(err: unknown): string {
     if (msg.includes('AbortError') || msg.includes('aborted') || msg.includes('canceled')) {
       return pc.yellow('[Request aborted]');
     }
-    return pc.red(`Error: ${sanitizeSecrets(msg)}`);
+    return pc.red(`Error: ${msg}`);
   }
   return pc.red(`An unexpected error occurred: ${sanitizeSecrets(String(err))}`);
 }

@@ -1,7 +1,17 @@
 import { GoogleGenAI, type Content, type Part, type FunctionDeclaration, Type } from '@google/genai';
-import { MissingApiKeyError, RateLimitError, LanternProviderError, ModelNotFoundError } from './errors.js';
-import { createLinkedAbortController, wrapStreamWithFirstTokenTimeout } from './timeout.js';
+import {
+  MissingApiKeyError,
+  RateLimitError,
+  LanternProviderError,
+  ModelNotFoundError,
+  AuthenticationError,
+  TimeoutError,
+  FirstTokenTimeoutError,
+  CancelledError
+} from './errors.js';
+import { createLinkedAbortController, wrapStreamWithFirstTokenTimeout, withTimeoutRace } from './timeout.js';
 import { getApiKey, maskApiKey } from '../security/credentials.js';
+import { sanitizeSecrets } from '../security/secrets.js';
 import type {
   IProviderAdapter,
   ProviderStreamParams,
@@ -40,12 +50,15 @@ export class GeminiProvider implements IProviderAdapter {
     return key ? maskApiKey(key) : '(not configured)';
   }
 
-  private getClient(): GoogleGenAI {
+  private getClient(httpOptions?: { timeout?: number }): GoogleGenAI {
     const key = this.getApiKey();
     if (!key) {
       throw new MissingApiKeyError('gemini', 'GEMINI_API_KEY');
     }
-    return new GoogleGenAI({ apiKey: key });
+    return new GoogleGenAI({
+      apiKey: key,
+      httpOptions: httpOptions || { timeout: 30000 }
+    });
   }
 
   public getCapabilities(modelId: string): ModelCapabilities {
@@ -66,13 +79,26 @@ export class GeminiProvider implements IProviderAdapter {
     }
     const startTime = Date.now();
     try {
-      const client = this.getClient();
+      const client = this.getClient({ timeout: 10000 });
       const testModel = this.defaultModel;
 
-      await client.models.countTokens({
+      const abortController = new AbortController();
+      const countPromise = client.models.countTokens({
         model: testModel,
-        contents: 'test'
+        contents: 'test',
+        config: {
+          abortSignal: abortController.signal,
+          httpOptions: { timeout: 10000 }
+        }
       });
+
+      await withTimeoutRace(
+        countPromise,
+        10000,
+        `Connection check for ${this.displayName}`,
+        abortController.signal,
+        () => abortController.abort()
+      );
 
       return {
         success: true,
@@ -83,7 +109,7 @@ export class GeminiProvider implements IProviderAdapter {
       return {
         success: false,
         latencyMs: Date.now() - startTime,
-        error: err.message || String(err)
+        error: sanitizeSecrets(err.message || String(err))
       };
     }
   }
@@ -94,8 +120,23 @@ export class GeminiProvider implements IProviderAdapter {
     }
 
     try {
-      const client = this.getClient();
-      const pagedList = await client.models.list();
+      const client = this.getClient({ timeout: 10000 });
+      const abortController = new AbortController();
+      const listPromise = client.models.list({
+        config: {
+          abortSignal: abortController.signal,
+          httpOptions: { timeout: 10000 }
+        }
+      });
+
+      const pagedList = await withTimeoutRace(
+        listPromise,
+        10000,
+        `Model listing for ${this.displayName}`,
+        abortController.signal,
+        () => abortController.abort()
+      );
+
       const models: ProviderModelInfo[] = [];
 
       for await (const m of pagedList) {
@@ -154,13 +195,32 @@ export class GeminiProvider implements IProviderAdapter {
       toolExecutionMs: {}
     };
 
-    const client = this.getClient();
+    if (params.callbacks.onStateChange) {
+      params.callbacks.onStateChange('resolving_credentials');
+    }
+
+    if (params.signal?.aborted) {
+      throw params.signal.reason || new CancelledError();
+    }
+
+    const key = this.getApiKey();
+    if (!key) {
+      throw new MissingApiKeyError(this.id, 'GEMINI_API_KEY');
+    }
+
     const contents = this.convertHistoryToContents(params.history);
     const functionDeclarations = this.convertToolsToDeclarations(params.tools);
 
+    const timeoutMs = params.timeoutMs || 60000;
+    const firstTokenTimeoutMs = params.firstTokenTimeoutMs || 30000;
+    const connectTimeoutMs = Math.min(timeoutMs, 15000); // Bounded connection setup timeout
+
+    const client = this.getClient({ timeout: connectTimeoutMs });
+
     const config: Record<string, unknown> = {
       systemInstruction: params.systemInstruction,
-      temperature: params.temperature ?? (params.lowLatency ? 0.1 : 0.2)
+      temperature: params.temperature ?? (params.lowLatency ? 0.1 : 0.2),
+      httpOptions: { timeout: connectTimeoutMs }
     };
 
     if (params.maxOutputTokens) {
@@ -178,9 +238,6 @@ export class GeminiProvider implements IProviderAdapter {
       config.tools = toolList;
     }
 
-    const timeoutMs = params.timeoutMs || 60000;
-    const firstTokenTimeoutMs = params.firstTokenTimeoutMs || 30000;
-
     let attempts = 0;
     const maxAttempts = 3;
     let lastError: unknown = null;
@@ -189,18 +246,32 @@ export class GeminiProvider implements IProviderAdapter {
       attempts++;
       const connectStart = Date.now();
 
+      if (params.signal?.aborted) {
+        throw params.signal.reason || new CancelledError();
+      }
+
       if (params.callbacks.onStateChange) {
         params.callbacks.onStateChange(attempts > 1 ? `retrying:${attempts}` : 'connecting');
       }
 
       const { controller, cleanup } = createLinkedAbortController(params.signal, timeoutMs);
+      config.abortSignal = controller.signal;
 
       try {
-        const responseStream = await client.models.generateContentStream({
+        // Bounded connection establishment with reliable provider-level timeout
+        const connectionPromise = client.models.generateContentStream({
           model: params.model,
           contents,
           config
         });
+
+        const responseStream = await withTimeoutRace(
+          connectionPromise,
+          connectTimeoutMs,
+          `Connection to ${this.displayName} (${params.model})`,
+          controller.signal,
+          () => controller.abort(new TimeoutError(connectTimeoutMs, `Connection to ${this.displayName} (${params.model})`))
+        );
 
         timing.connectMs = Date.now() - connectStart;
 
@@ -232,6 +303,10 @@ export class GeminiProvider implements IProviderAdapter {
 
         const streamStart = Date.now();
         for await (const chunk of wrappedStream) {
+          if (controller.signal.aborted) {
+            throw controller.signal.reason || new CancelledError();
+          }
+
           if (chunk.text) {
             fullText += chunk.text;
             if (params.callbacks.onChunk) {
@@ -246,6 +321,9 @@ export class GeminiProvider implements IProviderAdapter {
                 name: fc.name || '',
                 args: (fc.args as Record<string, unknown>) || {}
               });
+            }
+            if (params.callbacks.onStateChange) {
+              params.callbacks.onStateChange('streaming');
             }
           }
 
@@ -268,6 +346,11 @@ export class GeminiProvider implements IProviderAdapter {
 
         cleanup();
 
+        // Handle empty text chunks or function-call-only responses gracefully
+        if (!fullText && collectedToolCalls.length === 0) {
+          fullText = `[Received empty response from ${this.displayName} (${params.model})]`;
+        }
+
         return {
           text: fullText,
           toolCalls: collectedToolCalls,
@@ -278,23 +361,47 @@ export class GeminiProvider implements IProviderAdapter {
         cleanup();
         lastError = err;
 
-        if (params.signal?.aborted) {
+        if (params.signal?.aborted || err instanceof CancelledError) {
+          throw err instanceof CancelledError ? err : (params.signal?.reason || new CancelledError());
+        }
+
+        if (err instanceof TimeoutError || err instanceof FirstTokenTimeoutError) {
           throw err;
         }
 
         const msg = String(err?.message || err);
-        if (msg.includes('API_KEY_INVALID') || msg.includes('401') || msg.includes('403')) {
-          throw new LanternProviderError(`Authentication failed: ${msg}`, 401, this.id);
+
+        if (
+          msg.includes('API_KEY_INVALID') ||
+          msg.includes('API key not valid') ||
+          msg.includes('401') ||
+          msg.includes('403') ||
+          msg.includes('PERMISSION_DENIED')
+        ) {
+          throw new AuthenticationError(`Authentication failed for ${this.displayName}: Invalid or restricted API key. Please run 'lantern keys set ${this.id}' or verify GEMINI_API_KEY.`);
         }
-        if (msg.includes('NOT_FOUND') || msg.includes('models/')) {
+
+        if (
+          msg.includes('NOT_FOUND') ||
+          msg.includes('not found') ||
+          msg.includes('is not supported') ||
+          msg.includes('models/')
+        ) {
           throw new ModelNotFoundError(params.model, this.displayName);
         }
 
-        const isRateLimit = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
-        const isTransient = msg.includes('503') || msg.includes('overloaded') || msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT') || msg.includes('socket hang up');
+        const isRateLimit = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
+        const isTransient =
+          msg.includes('503') ||
+          msg.includes('500') ||
+          msg.includes('overloaded') ||
+          msg.includes('ECONNRESET') ||
+          msg.includes('ETIMEDOUT') ||
+          msg.includes('socket hang up') ||
+          msg.includes('fetch failed');
 
-        if ((isRateLimit || isTransient) && attempts < maxAttempts) {
-          const backoff = Math.min(1000 * Math.pow(1.5, attempts), 3000); // Capped small backoff (max 3s)
+        if ((isRateLimit || isTransient) && attempts < maxAttempts && !params.signal?.aborted) {
+          const backoff = Math.min(1000 * Math.pow(1.5, attempts), 3000);
           if (params.callbacks.onStateChange) {
             params.callbacks.onStateChange(`retrying:${attempts}`);
           }
@@ -303,14 +410,14 @@ export class GeminiProvider implements IProviderAdapter {
         }
 
         if (isRateLimit) {
-          throw new RateLimitError(msg);
+          throw new RateLimitError(`Rate limit or quota reached for ${this.displayName}. Please wait a few seconds before retrying.`);
         }
 
-        throw new LanternProviderError(`Gemini request failed: ${msg}`, undefined, this.id);
+        throw new LanternProviderError(`Gemini request failed: ${sanitizeSecrets(msg)}`, undefined, this.id);
       }
     }
 
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    throw lastError instanceof Error ? lastError : new Error(sanitizeSecrets(String(lastError)));
   }
 
   private convertHistoryToContents(turns: ConversationTurn[]): Content[] {

@@ -41,12 +41,16 @@ export class TerminalSpinner {
     return this;
   }
 
+  public resolvingCredentials(provider: string): this {
+    return this.update(`Resolving credentials for ${pc.cyan(provider)}...`);
+  }
+
   public connecting(provider: string, model: string): this {
     return this.update(`Connecting to ${pc.cyan(provider)} (${pc.bold(model)})...`);
   }
 
   public waitingFirstToken(provider: string, model: string): this {
-    return this.update(`Waiting for first token from ${pc.cyan(provider)}...`);
+    return this.update(`Waiting for first token from ${pc.cyan(provider)} (${pc.bold(model)})...`);
   }
 
   public receiving(tokensCount?: number): this {

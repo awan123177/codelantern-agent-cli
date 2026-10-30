@@ -1,6 +1,16 @@
-import { MissingApiKeyError, RateLimitError, LanternProviderError, ModelNotFoundError, AuthenticationError } from './errors.js';
-import { createLinkedAbortController, wrapStreamWithFirstTokenTimeout } from './timeout.js';
+import {
+  MissingApiKeyError,
+  RateLimitError,
+  LanternProviderError,
+  ModelNotFoundError,
+  AuthenticationError,
+  TimeoutError,
+  FirstTokenTimeoutError,
+  CancelledError
+} from './errors.js';
+import { createLinkedAbortController, wrapStreamWithFirstTokenTimeout, withTimeoutRace } from './timeout.js';
 import { getApiKey, maskApiKey } from '../security/credentials.js';
+import { sanitizeSecrets } from '../security/secrets.js';
 import type {
   IProviderAdapter,
   ProviderStreamParams,
@@ -233,6 +243,11 @@ export class OpenAIProvider implements IProviderAdapter {
 
     const timeoutMs = params.timeoutMs || 60000;
     const firstTokenTimeoutMs = params.firstTokenTimeoutMs || 30000;
+    const connectTimeoutMs = Math.min(timeoutMs, 15000);
+
+    if (params.callbacks.onStateChange) {
+      params.callbacks.onStateChange('resolving_credentials');
+    }
 
     let attempts = 0;
     const maxAttempts = 3;
@@ -242,6 +257,10 @@ export class OpenAIProvider implements IProviderAdapter {
       attempts++;
       const connectStart = Date.now();
 
+      if (params.signal?.aborted) {
+        throw params.signal.reason || new CancelledError();
+      }
+
       if (params.callbacks.onStateChange) {
         params.callbacks.onStateChange(attempts > 1 ? `retrying:${attempts}` : 'connecting');
       }
@@ -249,7 +268,7 @@ export class OpenAIProvider implements IProviderAdapter {
       const { controller, cleanup } = createLinkedAbortController(params.signal, timeoutMs);
 
       try {
-        const response = await fetch(`${this.baseUrl}/chat/completions`, {
+        const fetchPromise = fetch(`${this.baseUrl}/chat/completions`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -259,6 +278,14 @@ export class OpenAIProvider implements IProviderAdapter {
           body: JSON.stringify(payload),
           signal: controller.signal
         });
+
+        const response = await withTimeoutRace(
+          fetchPromise,
+          connectTimeoutMs,
+          `Connection to ${this.displayName} (${params.model})`,
+          controller.signal,
+          () => controller.abort(new TimeoutError(connectTimeoutMs, `Connection to ${this.displayName} (${params.model})`))
+        );
 
         timing.connectMs = Date.now() - connectStart;
 
