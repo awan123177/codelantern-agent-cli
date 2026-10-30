@@ -113,7 +113,14 @@ export async function skillsCommand(
     const result = isGit ? manager.addSkillFromGit(target) : manager.addSkillFromPath(target);
 
     if (result.success) {
-      console.log(pc.green(`✓ Successfully added and enabled skill '${result.skillName}'`));
+      if (result.skillNames && result.skillNames.length > 1) {
+        console.log(pc.green(`✓ Successfully added and enabled ${result.skillNames.length} skills:`));
+        for (const name of result.skillNames) {
+          console.log(`  - ${pc.bold(name)}`);
+        }
+      } else {
+        console.log(pc.green(`✓ Successfully added and enabled skill '${result.skillName}'`));
+      }
     } else {
       console.error(pc.red(`✗ Failed to add skill: ${result.error}`));
       process.exit(1);

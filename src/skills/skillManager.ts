@@ -165,50 +165,114 @@ export class SkillManager {
     return removed;
   }
 
-  public addSkillFromPath(sourcePath: string): { success: boolean; skillName?: string; error?: string } {
+  private discoverSkillFiles(dir: string, depth = 0, maxDepth = 4): string[] {
+    const skillFiles: string[] = [];
+    if (depth > maxDepth || !fs.existsSync(dir)) return skillFiles;
+
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name.startsWith('.') || entry.name === 'node_modules' || entry.name === 'tests') continue;
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isFile() && entry.name === 'SKILL.md') {
+          skillFiles.push(fullPath);
+        } else if (entry.isDirectory()) {
+          skillFiles.push(...this.discoverSkillFiles(fullPath, depth + 1, maxDepth));
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    return skillFiles;
+  }
+
+  public addSkillFromPath(sourcePath: string): { success: boolean; skillName?: string; skillNames?: string[]; error?: string } {
     const resolved = path.resolve(sourcePath);
     if (!fs.existsSync(resolved)) {
       return { success: false, error: `Path does not exist: ${sourcePath}` };
     }
 
     const stat = fs.statSync(resolved);
-    let targetSkillDir = '';
-    let skillName = '';
+    const installedSkills: string[] = [];
 
     if (stat.isDirectory()) {
-      const skillMd = path.join(resolved, 'SKILL.md');
-      if (!fs.existsSync(skillMd)) {
-        return { success: false, error: `No SKILL.md found in directory: ${sourcePath}` };
+      const skillFiles = this.discoverSkillFiles(resolved);
+      if (skillFiles.length === 0) {
+        return { success: false, error: `No SKILL.md found in directory or subdirectories: ${sourcePath}` };
       }
-      const raw = fs.readFileSync(skillMd, 'utf8');
-      const parsed = this.parseSkillMd(raw, path.basename(resolved));
-      skillName = parsed.name;
-      targetSkillDir = path.join(this.userSkillsDir, skillName);
 
-      // Copy directory safely (never executing scripts)
-      fs.cpSync(resolved, targetSkillDir, { recursive: true });
+      // Collect all directories containing a SKILL.md
+      const skillDirMap = new Map<string, string>(); // dirPath -> skillMdPath
+      for (const sf of skillFiles) {
+        skillDirMap.set(path.dirname(sf), sf);
+      }
+
+      const allSkillDirs = new Set(skillDirMap.keys());
+
+      // Sort skill directories deepest first so leaf skills are copied cleanly
+      const sortedSkillDirs = Array.from(skillDirMap.entries()).sort(
+        (a, b) => b[0].length - a[0].length
+      );
+
+      for (const [sDir, sMdPath] of sortedSkillDirs) {
+        try {
+          const raw = fs.readFileSync(sMdPath, 'utf8');
+          const parsed = this.parseSkillMd(raw, path.basename(sDir));
+          const skillName = parsed.name;
+          const targetSkillDir = path.join(this.userSkillsDir, skillName);
+
+          if (!fs.existsSync(targetSkillDir)) {
+            fs.mkdirSync(targetSkillDir, { recursive: true });
+          }
+
+          // Check if sDir contains other subdirectories that are separate skills
+          const entries = fs.readdirSync(sDir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+            const itemPath = path.join(sDir, entry.name);
+            // Skip subdirectories that are independent skills
+            if (allSkillDirs.has(itemPath)) continue;
+
+            fs.cpSync(itemPath, path.join(targetSkillDir, entry.name), { recursive: true });
+          }
+
+          this.enableSkill(skillName);
+          installedSkills.push(skillName);
+        } catch {
+          // ignore individual failed skill copy
+        }
+      }
+
+      if (installedSkills.length === 0) {
+        return { success: false, error: `Failed to install skills from ${sourcePath}` };
+      }
+
+      return {
+        success: true,
+        skillName: installedSkills[0],
+        skillNames: installedSkills
+      };
     } else if (stat.isFile() && path.basename(resolved).toLowerCase().endsWith('.md')) {
       const raw = fs.readFileSync(resolved, 'utf8');
-      skillName = path.basename(resolved, path.extname(resolved));
-      const parsed = this.parseSkillMd(raw, skillName);
-      skillName = parsed.name;
-      targetSkillDir = path.join(this.userSkillsDir, skillName);
+      const defaultName = path.basename(resolved, path.extname(resolved));
+      const parsed = this.parseSkillMd(raw, defaultName);
+      const skillName = parsed.name;
+      const targetSkillDir = path.join(this.userSkillsDir, skillName);
 
       if (!fs.existsSync(targetSkillDir)) {
         fs.mkdirSync(targetSkillDir, { recursive: true });
       }
       fs.writeFileSync(path.join(targetSkillDir, 'SKILL.md'), raw, 'utf8');
+      this.enableSkill(skillName);
+
+      return { success: true, skillName, skillNames: [skillName] };
     } else {
       return { success: false, error: 'Source must be a skill folder with SKILL.md or a markdown file.' };
     }
-
-    // Auto-enable newly added skill
-    this.enableSkill(skillName);
-
-    return { success: true, skillName };
   }
 
-  public addSkillFromGit(repoUrl: string): { success: boolean; skillName?: string; error?: string } {
+  public addSkillFromGit(repoUrl: string): { success: boolean; skillName?: string; skillNames?: string[]; error?: string } {
     try {
       const tempCloneDir = path.join(this.userSkillsDir, `_temp_${Date.now()}`);
       execSync(`git clone --depth 1 "${repoUrl}" "${tempCloneDir}"`, { stdio: 'pipe' });
