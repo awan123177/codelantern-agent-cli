@@ -1,8 +1,8 @@
 import type { OrbitConfig } from '../types.js';
 
 export const DEFAULT_CONFIG: OrbitConfig = {
-  activeProvider: 'gemini',
-  defaultModel: 'gemini-3.8-flash',
+  activeProvider: 'openrouter',
+  defaultModel: 'openrouter/free',
   maxSteps: 25,
   temperature: 0.2,
   maxOutputTokens: 8192,
@@ -11,9 +11,11 @@ export const DEFAULT_CONFIG: OrbitConfig = {
   autoCompactThreshold: 30, // turns before auto-compacting
   timeoutMs: 60000,
   firstTokenTimeoutMs: 30000,
+  connectTimeoutMs: 15000,
   showTiming: false,
   lowLatency: false,
   activeSkills: [],
+  disabledSkills: [],
   mcpServers: {},
   providers: {}
 };
@@ -29,9 +31,11 @@ export const ALLOWED_CONFIG_KEYS = [
   'autoCompactThreshold',
   'timeoutMs',
   'firstTokenTimeoutMs',
+  'connectTimeoutMs',
   'showTiming',
   'lowLatency',
-  'activeSkills'
+  'activeSkills',
+  'disabledSkills'
 ] as const;
 
 export type ConfigKey = (typeof ALLOWED_CONFIG_KEYS)[number];
@@ -112,6 +116,14 @@ export function validateConfigValue(key: string, value: unknown): { valid: boole
       return { valid: true, parsedValue: Math.round(num) };
     }
 
+    case 'connectTimeoutMs': {
+      const num = Number(value);
+      if (isNaN(num) || num < 2000) {
+        return { valid: false, error: 'connectTimeoutMs must be at least 2000 (ms)' };
+      }
+      return { valid: true, parsedValue: Math.round(num) };
+    }
+
     case 'showTiming': {
       if (typeof value === 'boolean') return { valid: true, parsedValue: value };
       if (value === 'true' || value === '1') return { valid: true, parsedValue: true };
@@ -134,6 +146,16 @@ export function validateConfigValue(key: string, value: unknown): { valid: boole
         return { valid: true, parsedValue: value.split(',').map(s => s.trim()).filter(Boolean) };
       }
       return { valid: false, error: 'activeSkills must be an array of strings or comma-separated string' };
+    }
+
+    case 'disabledSkills': {
+      if (Array.isArray(value)) {
+        return { valid: true, parsedValue: value.map(String) };
+      }
+      if (typeof value === 'string') {
+        return { valid: true, parsedValue: value.split(',').map(s => s.trim()).filter(Boolean) };
+      }
+      return { valid: false, error: 'disabledSkills must be an array of strings or comma-separated string' };
     }
 
     default:

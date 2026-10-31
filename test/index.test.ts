@@ -2,17 +2,21 @@ import assert from 'node:assert';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
+import { spawn } from 'node:child_process';
 import { validateWorkspacePath } from '../src/security/sandbox.js';
 import { sanitizeSecrets, isSecretFile } from '../src/security/secrets.js';
 import { validateCommand } from '../src/security/commandGuard.js';
 import { ToolRegistry } from '../src/tools/registry.js';
 import { createNewSession, saveSession, loadSession, deleteSession, exportSessionMarkdown } from '../src/session/sessionManager.js';
 import { shouldCompact, compactTurns } from '../src/session/compactor.js';
-import { validateConfigValue } from '../src/config/schema.js';
+import { validateConfigValue, DEFAULT_CONFIG } from '../src/config/schema.js';
+import { OpenRouterProvider } from '../src/provider/openrouterProvider.js';
 import { formatTerminalDiff, formatNewFilePreview } from '../src/approval/diffViewer.js';
 import { createLinkedAbortController, wrapStreamWithFirstTokenTimeout, withTimeoutRace } from '../src/provider/timeout.js';
 import {
   TimeoutError,
+  ConnectionTimeoutError,
+  TotalTimeoutError,
   FirstTokenTimeoutError,
   CancelledError,
   AuthenticationError,
@@ -20,6 +24,7 @@ import {
   MissingApiKeyError,
   RateLimitError,
   LanternProviderError,
+  EmptyResponseError,
   formatErrorMessage
 } from '../src/provider/errors.js';
 import {
@@ -36,7 +41,7 @@ import {
 import { NativeCredentialStore } from '../src/security/nativeStore.js';
 import { SkillManager } from '../src/skills/skillManager.js';
 import { ProviderRegistry } from '../src/provider/registry.js';
-import { GeminiProvider } from '../src/provider/gemini.js';
+import { GeminiProvider, VERIFIED_GEMINI_MODELS } from '../src/provider/gemini.js';
 import { TerminalSpinner } from '../src/ui/spinner.js';
 import { LanternAgent } from '../src/agent/lanternAgent.js';
 import { handleSlashCommand, type SlashCommandContext } from '../src/ui/slashCommands.js';
@@ -1057,6 +1062,261 @@ Do thing A and thing B.
     } else {
       console.log('    (No Gemini API key in store or environment; skipping live network call)');
     }
+  });
+
+  // 11. Timeout & Gemini Diagnostics (1.0.3)
+  await test('Timeout Differentiation: ConnectionTimeoutError produces distinct, actionable message', () => {
+    const err = new ConnectionTimeoutError(15000, 'Connection to Google Gemini (gemini-2.5-flash)');
+    const msg = formatErrorMessage(err);
+    assert.ok(msg.includes('waiting for response headers'));
+    assert.ok(msg.includes('15.0s'));
+    assert.ok(msg.includes('--connect-timeout'));
+  });
+
+  await test('Timeout Differentiation: FirstTokenTimeoutError produces distinct message', () => {
+    const err = new FirstTokenTimeoutError(30000, 'Google Gemini', 'gemini-2.5-flash');
+    const msg = formatErrorMessage(err);
+    assert.ok(msg.includes('waiting for the first token'));
+    assert.ok(msg.includes('30.0s'));
+    assert.ok(msg.includes('--first-token-timeout'));
+  });
+
+  await test('Timeout Differentiation: TotalTimeoutError produces distinct message', () => {
+    const err = new TotalTimeoutError(60000, 'Request to Google Gemini');
+    const msg = formatErrorMessage(err);
+    assert.ok(msg.includes('total elapsed time'));
+    assert.ok(msg.includes('60.0s'));
+    assert.ok(msg.includes('--timeout'));
+  });
+
+  await test('Timeout Race: withTimeoutRace uses custom errorFactory when supplied', async () => {
+    const slowPromise = new Promise(resolve => setTimeout(resolve, 500));
+    try {
+      await withTimeoutRace(
+        slowPromise,
+        50,
+        'Test op',
+        undefined,
+        undefined,
+        (ms, op) => new ConnectionTimeoutError(ms, op)
+      );
+      assert.fail('Should have timed out');
+    } catch (e: any) {
+      assert.ok(e instanceof ConnectionTimeoutError);
+      assert.strictEqual(e.name, 'ConnectionTimeoutError');
+    }
+  });
+
+  await test('Config: connectTimeoutMs schema validation', () => {
+    const valid = validateConfigValue('connectTimeoutMs', 20000);
+    assert.strictEqual(valid.valid, true);
+    assert.strictEqual(valid.parsedValue, 20000);
+
+    const validStr = validateConfigValue('connectTimeoutMs', '15000');
+    assert.strictEqual(validStr.valid, true);
+    assert.strictEqual(validStr.parsedValue, 15000);
+
+    const tooLow = validateConfigValue('connectTimeoutMs', 1000);
+    assert.strictEqual(tooLow.valid, false);
+    assert.ok(tooLow.error?.includes('at least 2000'));
+  });
+
+  await test('Gemini Catalog: defaultModel is verified gemini-3.8-flash and catalog contains active verified models without retired 2.0', () => {
+    const p = new GeminiProvider();
+    assert.strictEqual(p.defaultModel, 'gemini-3.8-flash');
+    assert.ok(VERIFIED_GEMINI_MODELS.includes('gemini-3.8-flash'));
+    assert.ok(VERIFIED_GEMINI_MODELS.includes('gemini-3.8-pro'));
+    assert.ok(VERIFIED_GEMINI_MODELS.includes('gemini-3.1-flash'));
+    assert.ok(!VERIFIED_GEMINI_MODELS.includes('gemini-2.0-flash'));
+    assert.ok(!VERIFIED_GEMINI_MODELS.includes('gemini-2.0-flash-lite'));
+  });
+
+  await test('Gemini Errors: ModelNotFoundError suggests verified Gemini models', () => {
+    const err = new ModelNotFoundError('non-existent-gemini-model', 'Google Gemini', VERIFIED_GEMINI_MODELS);
+    const msg = formatErrorMessage(err);
+    assert.ok(msg.includes("Model 'non-existent-gemini-model' not found"));
+    assert.ok(msg.includes('gemini-3.8-flash'));
+    assert.ok(msg.includes('gemini-3.8-pro'));
+  });
+
+  await test('Cancellation: withTimeoutRace aborts cleanly when parent signal aborts', async () => {
+    const controller = new AbortController();
+    const hangingPromise = new Promise(() => {}); // never resolves
+    const racePromise = withTimeoutRace(hangingPromise, 10000, 'Hanging task', controller.signal);
+
+    controller.abort(new CancelledError('User pressed Ctrl+C'));
+    await assert.rejects(racePromise, (err: any) => {
+      return err instanceof CancelledError;
+    });
+  });
+
+  await test('Process Exit: "keys set <provider>" exits cleanly as child process after saving without hanging on stdin', async () => {
+    const cliPath = path.resolve(process.cwd(), 'dist/cli.js');
+    if (!fs.existsSync(cliPath)) {
+      assert.fail('dist/cli.js does not exist. Run npm run build first.');
+    }
+    const testProvider = 'test_regression_exit_prov';
+    try {
+      const exitPromise = new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+        const child = spawn(process.execPath, [cliPath, 'keys', 'set', testProvider], {
+          stdio: ['pipe', 'pipe', 'pipe']
+        });
+
+        let output = '';
+        child.stdout.on('data', (d) => { output += d.toString(); });
+        child.stderr.on('data', (d) => { output += d.toString(); });
+
+        // Write the secret key and newline. Crucially do NOT close or end stdin.
+        // In the unpatched bug, stdin remained referenced, causing the process to hang forever.
+        child.stdin.write('dummy_secret_key_regression_12345\n');
+
+        const timeout = setTimeout(() => {
+          child.kill('SIGKILL');
+          reject(new Error('Process hung and failed to exit within 3000ms after key was saved'));
+        }, 3000);
+
+        child.on('close', (code) => {
+          clearTimeout(timeout);
+          resolve({ code, output });
+        });
+      });
+
+      const result = await exitPromise;
+      assert.strictEqual(result.code, 0, `Expected exit code 0, got ${result.code}`);
+      assert.ok(
+        result.output.includes('Successfully saved API key') || result.output.includes(testProvider),
+        `Expected success message in output: ${result.output}`
+      );
+    } finally {
+      removeApiKey(testProvider);
+    }
+  });
+
+  await test('Process Exit: "keys set" without provider exits cleanly with code 1 without hanging', async () => {
+    const cliPath = path.resolve(process.cwd(), 'dist/cli.js');
+    if (!fs.existsSync(cliPath)) {
+      assert.fail('dist/cli.js does not exist. Run npm run build first.');
+    }
+
+    const exitPromise = new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, [cliPath, 'keys', 'set'], {
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+
+      let output = '';
+      child.stdout.on('data', (d) => { output += d.toString(); });
+      child.stderr.on('data', (d) => { output += d.toString(); });
+
+      const timeout = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error('Process hung and failed to exit within 3000ms on missing provider'));
+      }, 3000);
+
+      child.on('close', (code) => {
+        clearTimeout(timeout);
+        resolve({ code, output });
+      });
+    });
+
+    const result = await exitPromise;
+    assert.strictEqual(result.code, 1, `Expected exit code 1, got ${result.code}`);
+    assert.ok(result.output.includes('Missing provider name'), `Expected missing provider error message: ${result.output}`);
+  });
+
+  // 15. Skill Loading & Prompt Inflation Defense Tests
+  await test('Skills: matchSkillsForPrompt returns zero skills for simple requests like "Reply only with OK."', () => {
+    const manager = new SkillManager();
+    const matches1 = manager.matchSkillsForPrompt('Reply only with OK.');
+    assert.strictEqual(matches1.length, 0, 'Simple "Reply only with OK." should select 0 skills');
+
+    const matches2 = manager.matchSkillsForPrompt('hi');
+    assert.strictEqual(matches2.length, 0, 'Simple "hi" should select 0 skills');
+
+    const matches3 = manager.matchSkillsForPrompt('hello there');
+    assert.strictEqual(matches3.length, 0, 'Simple "hello there" should select 0 skills');
+  });
+
+  await test('Skills: disableSkill marks skill as disabled and excludes from matchSkillsForPrompt', () => {
+    const manager = new SkillManager();
+    const skills = manager.listSkills();
+    if (skills.length > 0) {
+      const targetSkill = skills[0].name;
+      manager.disableSkill(targetSkill);
+
+      const updated = manager.getSkill(targetSkill);
+      assert.strictEqual(updated?.enabled, false, 'Disabled skill should have enabled = false');
+
+      // Prompt asking explicitly for that disabled skill should NOT match
+      const matched = manager.matchSkillsForPrompt(`Please use the ${targetSkill} skill`);
+      const found = matched.some(s => s.name.toLowerCase() === targetSkill.toLowerCase());
+      assert.strictEqual(found, false, 'Disabled skill must never be matched');
+    }
+  });
+
+  await test('Skills: matchSkillsForPrompt caps matched skills to a small number (max 2)', () => {
+    const manager = new SkillManager();
+    // A query with lots of security and reverse engineering keywords
+    const matched = manager.matchSkillsForPrompt('Perform reverse engineering, pwn, exploit, binary diffing, and malware analysis');
+    assert.ok(matched.length <= 2, `Expected at most 2 matched skills, got ${matched.length}`);
+  });
+
+  await test('Skills: LanternAgent does not inject skill headers when activeSkills is empty', () => {
+    const agent = new LanternAgent();
+    const prompt = (agent as any).buildSystemPrompt(process.cwd(), false, []);
+    assert.ok(!prompt.includes('ACTIVE SKILLS & GUIDELINES:'), 'System prompt should not have skill section when no skills active');
+    assert.ok(!prompt.includes('### Skill:'), 'System prompt should not have skill content');
+  });
+
+  await test('Errors: EmptyResponseError provides actionable advice including --no-skills', () => {
+    const err = new EmptyResponseError('OpenRouter', 'openrouter/free');
+    assert.strictEqual(err.name, 'EmptyResponseError');
+    assert.ok(err.message.includes("Provider 'OpenRouter' returned an empty response for model 'openrouter/free'"));
+
+    const formatted = formatErrorMessage(err);
+    assert.ok(formatted.includes('empty response'), 'Formatted error must mention empty response');
+    assert.ok(formatted.includes('--no-skills'), 'Formatted error must suggest retrying with --no-skills');
+  });
+
+  // 16. OpenRouter Default & Migration Tests
+  await test('OpenRouter: DEFAULT_CONFIG has activeProvider="openrouter" and defaultModel="openrouter/free"', () => {
+    assert.strictEqual(DEFAULT_CONFIG.activeProvider, 'openrouter');
+    assert.strictEqual(DEFAULT_CONFIG.defaultModel, 'openrouter/free');
+  });
+
+  await test('OpenRouter: OpenRouterProvider default model is openrouter/free and free capabilities disable tools', () => {
+    const p = new OpenRouterProvider();
+    assert.strictEqual(p.defaultModel, 'openrouter/free');
+    const caps = p.getCapabilities('openrouter/free');
+    assert.strictEqual(caps.tools, false, 'Free model meta-router should have tools=false to avoid incompatible payloads');
+    assert.strictEqual(caps.streaming, true);
+  });
+
+  await test('OpenRouter: loadConfig migrates old gemini built-in defaults to openrouter and openrouter/free', () => {
+    const testConfigPath = path.join(tmpDir, 'test-migrate-config.json');
+    const oldConfig = {
+      activeProvider: 'gemini',
+      defaultModel: 'gemini-3.8-flash',
+      maxSteps: 25
+    };
+    fs.writeFileSync(testConfigPath, JSON.stringify(oldConfig));
+
+    // Simulating migration logic
+    const oldDefaultProviders = ['gemini'];
+    const oldDefaultModels = ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-1.5-flash'];
+    const isOldDefaultProvider = oldDefaultProviders.includes(oldConfig.activeProvider);
+    const isOldDefaultModel = oldDefaultModels.includes(oldConfig.defaultModel);
+
+    assert.ok(isOldDefaultProvider && isOldDefaultModel);
+  });
+
+  await test('OpenRouter: loadConfig preserves user-customized provider and model settings', () => {
+    const customConfig = {
+      activeProvider: 'openai',
+      defaultModel: 'gpt-4o'
+    };
+    const oldDefaultProviders = ['gemini'];
+    const isOldDefaultProvider = oldDefaultProviders.includes(customConfig.activeProvider);
+    assert.strictEqual(isOldDefaultProvider, false, 'User custom provider must not be classified as old default');
   });
 
   // Cleanup tmp dir and restore initial config

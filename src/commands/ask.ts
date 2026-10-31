@@ -19,16 +19,18 @@ export async function askCommand(
     json?: boolean;
     maxSteps?: number;
     timeout?: number;
+    connectTimeout?: number;
     firstTokenTimeout?: number;
     timing?: boolean;
     fast?: boolean;
     skill?: string[];
+    noSkills?: boolean;
   }
 ): Promise<void> {
   const config = loadConfig();
   const workspace = options.cwd || process.cwd();
-  const provider = options.provider || config.activeProvider || 'gemini';
-  const model = options.model || config.defaultModel || 'gemini-3.8-flash';
+  const provider = options.provider || config.activeProvider || 'openrouter';
+  const model = options.model || config.defaultModel || 'openrouter/free';
   const yolo = Boolean(options.yolo ?? config.yolo);
   const jsonOutput = Boolean(options.json);
   const showTiming = Boolean(options.timing ?? config.showTiming);
@@ -68,10 +70,12 @@ export async function askCommand(
     jsonOutput,
     maxSteps: options.maxSteps || config.maxSteps || 25,
     timeoutMs: options.timeout || config.timeoutMs || 60000,
+    connectTimeoutMs: options.connectTimeout || config.connectTimeoutMs || 15000,
     firstTokenTimeoutMs: options.firstTokenTimeout || config.firstTokenTimeoutMs || 30000,
     showTiming,
     lowLatency,
-    activeSkills: options.skill || config.activeSkills || [],
+    activeSkills: options.noSkills ? [] : (options.skill || []),
+    noSkills: Boolean(options.noSkills),
     attachments,
     signal: abortController.signal
   };
@@ -93,7 +97,11 @@ export async function askCommand(
     } else {
       const parts: string[] = [];
       if (result.usage.totalTokens > 0) {
-        parts.push(`Tokens: ${result.usage.totalTokens.toLocaleString()}`);
+        if (result.usage.promptTokens > 0) {
+          parts.push(`Tokens: ${result.usage.totalTokens.toLocaleString()} (Prompt: ${result.usage.promptTokens.toLocaleString()}, Completion: ${result.usage.candidatesTokens.toLocaleString()})`);
+        } else {
+          parts.push(`Tokens: ${result.usage.totalTokens.toLocaleString()}`);
+        }
       }
       if (showTiming && result.timing) {
         const ttft = result.timing.ttftMs ? `TTFT: ${result.timing.ttftMs}ms` : '';

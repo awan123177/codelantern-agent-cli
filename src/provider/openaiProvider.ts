@@ -229,7 +229,8 @@ export class OpenAIProvider implements IProviderAdapter {
       stream_options: { include_usage: true }
     };
 
-    if (tools.length > 0) {
+    const caps = this.getCapabilities(params.model);
+    if (caps.tools && tools.length > 0) {
       payload.tools = tools;
     }
 

@@ -8,7 +8,7 @@ export class OpenRouterProvider extends OpenAIProvider {
       name: 'openrouter',
       displayName: 'OpenRouter',
       baseUrl: 'https://openrouter.ai/api/v1',
-      defaultModel: 'anthropic/claude-3.7-sonnet',
+      defaultModel: 'openrouter/free',
       headers: {
         'HTTP-Referer': 'https://github.com/codelantern/codelantern-agent-cli',
         'X-Title': 'Code Lantern CLI'
@@ -19,9 +19,10 @@ export class OpenRouterProvider extends OpenAIProvider {
   public override getCapabilities(modelId: string): ModelCapabilities {
     const lower = modelId.toLowerCase();
     const isReasoning = lower.includes('r1') || lower.includes('o1') || lower.includes('o3') || lower.includes('reason');
+    const isFree = lower.includes(':free') || lower.includes('/free');
     return {
       streaming: true,
-      tools: !lower.includes(':free') && !lower.includes('deepseek-r1'), // Most OpenRouter models support tool calling
+      tools: !isFree && !lower.includes('deepseek-r1'), // Free models and pure reasoning models typically do not support tool calling
       images: lower.includes('vision') || lower.includes('gpt-4o') || lower.includes('claude-3') || lower.includes('gemini'),
       reasoning: isReasoning,
       contextWindow: 128000
@@ -86,6 +87,7 @@ export class OpenRouterProvider extends OpenAIProvider {
     }
 
     const verified = [
+      'openrouter/free',
       'anthropic/claude-3.7-sonnet',
       'anthropic/claude-3.5-sonnet',
       'openai/gpt-4o',

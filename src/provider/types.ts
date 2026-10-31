@@ -26,6 +26,7 @@ export interface ProviderStreamParams {
   maxOutputTokens?: number;
   timeoutMs?: number;
   firstTokenTimeoutMs?: number;
+  connectTimeoutMs?: number;
   lowLatency?: boolean;
   enableSearchGrounding?: boolean;
 }

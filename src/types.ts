@@ -127,9 +127,11 @@ export interface OrbitConfig {
   mcpServers?: Record<string, McpServerConfig>;
   timeoutMs: number;
   firstTokenTimeoutMs: number;
+  connectTimeoutMs?: number;
   showTiming: boolean;
   lowLatency: boolean;
   activeSkills: string[];
+  disabledSkills?: string[];
   providers?: Record<string, ProviderConfig>;
 }
 
@@ -157,9 +159,11 @@ export interface AgentContext {
   maxSteps: number;
   timeoutMs: number;
   firstTokenTimeoutMs: number;
+  connectTimeoutMs?: number;
   showTiming: boolean;
   lowLatency: boolean;
   activeSkills?: string[];
+  noSkills?: boolean;
   attachments?: FileAttachment[];
   signal?: AbortSignal;
   onStateChange?: (state: string) => void;

@@ -10,12 +10,44 @@ export class TimeoutError extends Error {
   }
 }
 
+export class ConnectionTimeoutError extends TimeoutError {
+  public provider: string;
+  public model: string;
+
+  constructor(timeoutMs: number, providerOrOp = 'Provider', model = '') {
+    const isOp = providerOrOp.includes(' ') || !model;
+    const desc = isOp ? providerOrOp : `Connection to ${providerOrOp} (${model})`;
+    super(timeoutMs, desc);
+    const target = model ? `Connection to ${providerOrOp} (${model})` : providerOrOp;
+    this.message = `${target} timed out after ${(timeoutMs / 1000).toFixed(1)}s waiting for response headers.`;
+    this.name = 'ConnectionTimeoutError';
+    this.provider = providerOrOp;
+    this.model = model;
+  }
+}
+
+export class TotalTimeoutError extends TimeoutError {
+  public provider: string;
+  public model: string;
+
+  constructor(timeoutMs: number, providerOrOp = 'Request', model = '') {
+    const isOp = providerOrOp.includes(' ') || !model;
+    const desc = isOp ? providerOrOp : `Request to ${providerOrOp} (${model})`;
+    super(timeoutMs, desc);
+    const target = model ? `Request to ${providerOrOp} (${model})` : providerOrOp;
+    this.message = `${target} timed out after ${(timeoutMs / 1000).toFixed(1)}s total elapsed time.`;
+    this.name = 'TotalTimeoutError';
+    this.provider = providerOrOp;
+    this.model = model;
+  }
+}
+
 export class FirstTokenTimeoutError extends Error {
   public timeoutMs: number;
   public provider: string;
   public model: string;
   constructor(timeoutMs: number, provider: string, model: string) {
-    super(`No response tokens received from ${provider} (${model}) after ${(timeoutMs / 1000).toFixed(1)}s.`);
+    super(`Connection to ${provider} (${model}) timed out after ${(timeoutMs / 1000).toFixed(1)}s waiting for the first token.`);
     this.name = 'FirstTokenTimeoutError';
     this.timeoutMs = timeoutMs;
     this.provider = provider;
@@ -61,9 +93,29 @@ export class AuthenticationError extends Error {
 }
 
 export class ModelNotFoundError extends Error {
-  constructor(model: string, provider: string) {
-    super(`Model '${model}' not found or not available for provider '${provider}'.`);
+  public model: string;
+  public provider: string;
+  public suggestions?: string[];
+
+  constructor(model: string, provider: string, suggestions?: string[]) {
+    const list = suggestions && suggestions.length > 0 ? `\nAvailable models: ${suggestions.join(', ')}` : '';
+    super(`Model '${model}' not found or not available for provider '${provider}'.${list}`);
     this.name = 'ModelNotFoundError';
+    this.model = model;
+    this.provider = provider;
+    this.suggestions = suggestions;
+  }
+}
+
+export class EmptyResponseError extends Error {
+  public provider: string;
+  public model: string;
+
+  constructor(provider = 'Provider', model = '') {
+    super(`Provider '${provider}' returned an empty response for model '${model}'.`);
+    this.name = 'EmptyResponseError';
+    this.provider = provider;
+    this.model = model;
   }
 }
 
@@ -80,19 +132,40 @@ export class LanternProviderError extends Error {
 }
 
 export function formatErrorMessage(err: unknown): string {
+  if (err instanceof EmptyResponseError) {
+    return (
+      pc.red(`\n❌ ${sanitizeSecrets(err.message)}\n`) +
+      pc.yellow(
+        `  Tip: The model returned no text or tool calls.\n` +
+        `       - This often occurs if the prompt or loaded skills exceeded the model's context or rate limit.\n` +
+        `       - Retry with '--no-skills' to reduce prompt size: lantern ask --no-skills "..."\n` +
+        `       - Or switch to another model using '/model' or '--model <model-id>'.`
+      )
+    );
+  }
   if (err instanceof CancelledError) {
     return pc.yellow(`\n[Cancelled] ${sanitizeSecrets(err.message)}`);
+  }
+  if (err instanceof ConnectionTimeoutError) {
+    return (
+      pc.red(`\n⏱️ ${sanitizeSecrets(err.message)}\n`) +
+      pc.yellow(`  Tip: The provider server did not acknowledge the connection in time.\n` +
+                `       Adjust connection timeout with '--connect-timeout <ms>' or check network reachability.\n` +
+                `       Test connection with: 'lantern providers test ${err.provider.toLowerCase()}'`)
+    );
   }
   if (err instanceof FirstTokenTimeoutError) {
     return (
       pc.red(`\n⏱️ ${sanitizeSecrets(err.message)}\n`) +
-      pc.yellow(`  Tip: Check your network connection or try switching to a faster model with '/model' or 'lantern model set <id>'.`)
+      pc.yellow(`  Tip: Connection was established, but the model took too long to begin streaming tokens.\n` +
+                `       Adjust first-token timeout with '--first-token-timeout <ms>' or switch to a faster model with '/model'.`)
     );
   }
-  if (err instanceof TimeoutError) {
+  if (err instanceof TotalTimeoutError || err instanceof TimeoutError) {
     return (
       pc.red(`\n⏱️ ${sanitizeSecrets(err.message)}\n`) +
-      pc.yellow(`  Tip: Check your network connection. You can increase the timeout limit using 'lantern config set timeoutMs 120000' or test provider connectivity with 'lantern providers test'.`)
+      pc.yellow(`  Tip: Generation exceeded the total request time limit.\n` +
+                `       Increase limit with '--timeout <ms>' or 'lantern config set timeoutMs <ms>'.`)
     );
   }
   if (err instanceof MissingApiKeyError) {

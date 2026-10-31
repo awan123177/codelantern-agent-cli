@@ -19,22 +19,27 @@ const config = loadConfig();
 program
   .name('lantern')
   .description('Code Lantern CLI — Personal AI coding assistant for the terminal with multi-provider and skills support')
-  .version('1.0.2');
+  .version('1.0.3');
 
 // Global flags
 program
-  .option('-p, --provider <provider>', 'AI provider to use (gemini, openai, anthropic, openrouter, or custom)', config.activeProvider || 'gemini')
-  .option('-m, --model <model>', 'Model ID to use', config.defaultModel || 'gemini-3.8-flash')
+  .option('-p, --provider <provider>', 'AI provider to use (openrouter, gemini, openai, anthropic, or custom)', config.activeProvider || 'openrouter')
+  .option('-m, --model <model>', 'Model ID to use', config.defaultModel || 'openrouter/free')
   .option('-C, --cwd <path>', 'Working directory for Code Lantern agent', process.cwd())
   .option('-s, --session <id>', 'Resume or use a specific session ID')
   .option('-a, --attach <files...>', 'Attach one or more files/images/documents to the request')
   .option('--yolo', 'Enable YOLO mode (auto-approve file edits and shell commands)', false)
   .option('--json', 'Output results formatted as JSON', false)
   .option('--timeout <ms>', 'Maximum total request duration in milliseconds (default: 60000)', (val) => parseInt(val, 10))
+  .option('--connect-timeout <ms>', 'Maximum wait time for connection/headers in milliseconds (default: 15000)', (val) => parseInt(val, 10))
   .option('--first-token-timeout <ms>', 'Maximum wait time for initial token in milliseconds (default: 30000)', (val) => parseInt(val, 10))
   .option('--timing', 'Display detailed execution and latency timing diagnostics', false)
   .option('--fast', 'Enable low-latency streaming mode where supported', false)
-  .option('--skill <skills...>', 'Activate specific skills by name for this run');
+  .option('--skill <skills>', 'Activate specific skills by name (comma-separated or repeated flag)', (val, prev: string[] = []) => {
+    const parts = val.split(',').map(s => s.trim()).filter(Boolean);
+    return [...prev, ...parts];
+  })
+  .option('--no-skills', 'Disable all skills for this run (load no skill content)', false);
 
 // Subcommand: ask
 program
@@ -43,6 +48,7 @@ program
   .action(async (questionParts: string[]) => {
     const opts = program.opts();
     const question = questionParts.join(' ');
+    const noSkills = opts.skills === false || Boolean(opts.noSkills);
     await askCommand(question, {
       provider: opts.provider,
       model: opts.model,
@@ -51,10 +57,12 @@ program
       yolo: opts.yolo,
       json: opts.json,
       timeout: opts.timeout,
+      connectTimeout: opts.connectTimeout,
       firstTokenTimeout: opts.firstTokenTimeout,
       timing: opts.timing,
       fast: opts.fast,
-      skill: opts.skill
+      skill: opts.skill,
+      noSkills
     });
   });
 
@@ -65,6 +73,7 @@ program
   .action(async (taskParts: string[]) => {
     const opts = program.opts();
     const task = taskParts.join(' ');
+    const noSkills = opts.skills === false || Boolean(opts.noSkills);
     await planCommand(task, {
       provider: opts.provider,
       model: opts.model,
@@ -72,9 +81,11 @@ program
       attach: opts.attach,
       json: opts.json,
       timeout: opts.timeout,
+      connectTimeout: opts.connectTimeout,
       firstTokenTimeout: opts.firstTokenTimeout,
       timing: opts.timing,
-      skill: opts.skill
+      skill: opts.skill,
+      noSkills
     });
   });
 
@@ -84,6 +95,7 @@ program
   .description('Continue a saved conversation session')
   .action(async (sessionId?: string) => {
     const opts = program.opts();
+    const noSkills = opts.skills === false || Boolean(opts.noSkills);
     await resumeCommand(sessionId, {
       provider: opts.provider,
       model: opts.model,
@@ -91,10 +103,12 @@ program
       attach: opts.attach,
       yolo: opts.yolo,
       timeout: opts.timeout,
+      connectTimeout: opts.connectTimeout,
       firstTokenTimeout: opts.firstTokenTimeout,
       timing: opts.timing,
       fast: opts.fast,
-      skill: opts.skill
+      skill: opts.skill,
+      noSkills
     });
   });
 
@@ -196,6 +210,7 @@ program.action(async () => {
     }
 
     const trimmedPiped = pipedData.trim();
+    const noSkills = opts.skills === false || Boolean(opts.noSkills);
     if (trimmedPiped) {
       await askCommand(trimmedPiped, {
         provider: opts.provider,
@@ -205,14 +220,18 @@ program.action(async () => {
         yolo: opts.yolo,
         json: opts.json,
         timeout: opts.timeout,
+        connectTimeout: opts.connectTimeout,
         firstTokenTimeout: opts.firstTokenTimeout,
         timing: opts.timing,
         fast: opts.fast,
-        skill: opts.skill
+        skill: opts.skill,
+        noSkills
       });
       return;
     }
   }
+
+  const noSkills = opts.skills === false || Boolean(opts.noSkills);
 
   // Interactive mode
   await interactiveCommand({
@@ -223,10 +242,12 @@ program.action(async () => {
     attach: opts.attach,
     yolo: opts.yolo,
     timeout: opts.timeout,
+    connectTimeout: opts.connectTimeout,
     firstTokenTimeout: opts.firstTokenTimeout,
     timing: opts.timing,
     fast: opts.fast,
-    skill: opts.skill
+    skill: opts.skill,
+    noSkills
   });
 });
 

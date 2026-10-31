@@ -11,10 +11,12 @@ export async function resumeCommand(
     attach?: string[];
     yolo?: boolean;
     timeout?: number;
+    connectTimeout?: number;
     firstTokenTimeout?: number;
     timing?: boolean;
     fast?: boolean;
     skill?: string[];
+    noSkills?: boolean;
   } = {}
 ): Promise<void> {
   const sessions = listSessions();

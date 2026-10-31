@@ -12,7 +12,7 @@ export interface ModelClassification {
 }
 
 const DEFAULT_RECOMMENDED_CODING_MODELS: Record<string, string[]> = {
-  gemini: ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash'],
+  gemini: ['gemini-3.8-flash', 'gemini-3.8-pro', 'gemini-3.1-flash', 'gemini-3.1-pro'],
   openai: ['gpt-4o', 'gpt-4o-mini', 'o3-mini', 'gpt-4-turbo'],
   anthropic: ['claude-3-7-sonnet-20250219', 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022'],
   openrouter: [

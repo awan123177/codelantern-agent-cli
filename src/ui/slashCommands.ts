@@ -74,9 +74,13 @@ export async function handleSlashCommand(input: string, context: SlashCommandCon
       console.log(`${pc.bold('Workspace:')}        ${pc.blue(context.workspace)}`);
       console.log(`${pc.bold('Active Provider:')}  ${pc.magenta(context.provider)}`);
       console.log(`${pc.bold('Active Model:')}     ${pc.green(context.model)}`);
-      console.log(`${pc.bold('Active Skills:')}    ${context.activeSkills.length > 0 ? pc.yellow(context.activeSkills.join(', ')) : pc.dim('none')}`);
+      console.log(`${pc.bold('Active Skills:')}    ${context.activeSkills.length > 0 ? pc.yellow(context.activeSkills.join(', ')) : pc.dim('none (on-demand)')}`);
       console.log(`${pc.bold('Turns:')}            ${context.session.turns.length}`);
-      console.log(`${pc.bold('Total Tokens:')}     ${context.session.totalUsage.totalTokens.toLocaleString()}`);
+      const usage = context.session.totalUsage;
+      const tokenSummary = usage.promptTokens > 0
+        ? `${usage.totalTokens.toLocaleString()} (Prompt: ${usage.promptTokens.toLocaleString()}, Completion: ${usage.candidatesTokens.toLocaleString()})`
+        : usage.totalTokens.toLocaleString();
+      console.log(`${pc.bold('Total Tokens:')}     ${tokenSummary}`);
       console.log(`${pc.bold('Timing Logs:')}      ${context.showTiming ? pc.green('ON') : pc.dim('OFF')}`);
       console.log(`${pc.bold('YOLO Mode:')}        ${context.yolo ? pc.red('ON (Auto-approve)') : pc.green('OFF (Prompt approval)')}`);
       console.log(`${pc.bold('Plan Mode:')}        ${context.planMode ? pc.blue('ON (Read-only)') : pc.dim('OFF (Full execution)')}`);
@@ -241,7 +245,7 @@ export async function handleSlashCommand(input: string, context: SlashCommandCon
       if (trimmedArg.toLowerCase().startsWith('default ')) {
         const target = trimmedArg.slice(8).trim();
         if (!target) {
-          console.log(pc.yellow('Usage: /model default <model-id> (e.g. /model default gemini-3.8-flash)'));
+          console.log(pc.yellow('Usage: /model default <model-id> (e.g. /model default openrouter/free)'));
           return true;
         }
         switchModel(target, true);
@@ -395,29 +399,38 @@ export async function handleSlashCommand(input: string, context: SlashCommandCon
         const target = arg.trim();
         const skill = manager.getSkill(target, context.workspace);
         if (skill) {
-          const isCurrentlyActive = context.activeSkills.includes(skill.name);
-          if (isCurrentlyActive) {
+          const isCurrentlyLoaded = context.activeSkills.includes(skill.name);
+          if (isCurrentlyLoaded) {
             context.setActiveSkills(context.activeSkills.filter(s => s !== skill.name));
-            console.log(pc.yellow(`✓ Deactivated skill '${skill.name}' for this session.`));
+            console.log(pc.yellow(`✓ Unloaded skill '${skill.name}' from active session.`));
           } else {
             context.setActiveSkills([...context.activeSkills, skill.name]);
-            console.log(pc.green(`✓ Activated skill '${skill.name}' for this session.`));
+            console.log(pc.green(`✓ Loaded skill '${skill.name}' into active session.`));
           }
         } else {
           console.log(pc.red(`Skill '${target}' not found.`));
         }
       } else {
-        console.log('\n' + pc.bold(pc.yellow('🏮 Code Lantern Skills:')));
+        const loadedCount = context.activeSkills.length;
+        const enabledCount = skills.filter(s => s.enabled).length;
+        console.log('\n' + pc.bold(pc.yellow('🏮 Code Lantern Skills')));
+        console.log(pc.dim(`Session Loaded: ${loadedCount} | Config Enabled: ${enabledCount} | Installed: ${skills.length}`));
+        console.log(pc.dim('──────────────────────────────────────────────────────────────────────────────'));
         if (skills.length === 0) {
           console.log(pc.dim('  (No skills currently installed. Add one with: lantern skills add <path>)'));
         } else {
           for (const s of skills) {
-            const isSessionActive = context.activeSkills.includes(s.name);
-            const status = isSessionActive ? pc.green('● ACTIVE') : s.enabled ? pc.cyan('○ default') : pc.dim('○ inactive');
-            console.log(`  ${status} ${pc.bold(s.name)} - ${pc.dim(s.description.slice(0, 50))}`);
+            const isLoaded = context.activeSkills.includes(s.name);
+            const loadBadge = isLoaded ? pc.green('● LOADED ') : pc.dim('○        ');
+            const configBadge = s.enabled ? pc.cyan('[Enabled] ') : pc.dim('[Disabled]');
+            console.log(`  ${loadBadge} ${configBadge} ${pc.bold(s.name.padEnd(26))} - ${pc.dim(s.description.slice(0, 42))}`);
           }
         }
-        console.log(pc.dim(`\nToggle skill for session: /skills <name>\n`));
+        console.log(pc.dim('\nStatus Legend:'));
+        console.log(pc.dim('  • LOADED:   Skill content is actively injected into this session prompt.'));
+        console.log(pc.dim('  • Enabled:  Skill is permitted for auto-matching and session loading.'));
+        console.log(pc.dim('  • Disabled: Skill is excluded from automatic matching and requests.'));
+        console.log(pc.dim('\nToggle skill in session: /skills <name>\n'));
       }
       return true;
     }

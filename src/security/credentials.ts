@@ -218,6 +218,45 @@ export function getApiKey(provider: string): KeyResult {
     };
   }
 
+  // 4. Fallback checks across potential alternative service and account names
+  const fallbackTargets = [
+    { service: 'lantern', account: norm },
+    { service: 'orbit', account: norm },
+    { service: norm, account: norm },
+    { service: norm, account: 'default' },
+    { service: norm, account: 'api_key' },
+    { service: norm, account: 'antigravity' }
+  ];
+
+  if (norm === 'gemini') {
+    fallbackTargets.push(
+      { service: 'Google Gemini', account: 'gemini' },
+      { service: 'Google Gemini', account: 'default' },
+      { service: 'Google Gemini', account: 'api_key' },
+      { service: 'Google Gemini', account: 'antigravity' },
+      { service: 'gemini', account: 'antigravity' }
+    );
+  }
+
+  for (const target of fallbackTargets) {
+    try {
+      const fbKey = store.get(target.service, target.account);
+      if (fbKey && fbKey.trim().length > 0) {
+        // Automatically mirror to primary SERVICE_NAME:norm
+        try {
+          store.set(SERVICE_NAME, norm, fbKey.trim());
+        } catch {}
+        return {
+          key: fbKey.trim(),
+          source: 'store',
+          sourceDescription: `${store.getStoreName()} (${target.service})`
+        };
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   return { key: null };
 }
 
@@ -322,9 +361,23 @@ export async function promptMaskedApiKey(query: string): Promise<string> {
   if (!process.stdin.isTTY || !process.stdin.setRawMode) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     return new Promise((resolve) => {
+      let resolved = false;
+      const done = (val: string) => {
+        if (!resolved) {
+          resolved = true;
+          rl.close();
+          try {
+            process.stdin.pause();
+            process.stdin.unref();
+          } catch {}
+          resolve(val.trim());
+        }
+      };
       rl.question(promptText, (ans) => {
-        rl.close();
-        resolve(ans.trim());
+        done(ans);
+      });
+      rl.once('close', () => {
+        done('');
       });
     });
   }
@@ -337,16 +390,47 @@ export async function promptMaskedApiKey(query: string): Promise<string> {
     process.stdin.setEncoding('utf8');
 
     let key = '';
+    let cleanedUp = false;
+
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      try {
+        process.stdin.removeListener('data', onData);
+        process.stdin.removeListener('error', onError);
+        process.stdin.removeListener('end', onEnd);
+        process.stdin.setRawMode(wasRaw ?? false);
+        process.stdin.pause();
+        process.stdin.unref();
+      } catch {
+        // ignore
+      }
+    };
+
+    const onError = () => {
+      cleanup();
+      resolve('');
+    };
+
+    const onEnd = () => {
+      cleanup();
+      process.stdout.write('\n');
+      resolve(key.trim());
+    };
+
     const onData = (chunk: string) => {
       for (const char of chunk) {
         if (char === '\u0003') { // Ctrl+C
-          process.stdin.setRawMode(wasRaw ?? false);
-          process.stdin.removeListener('data', onData);
+          cleanup();
           process.stdout.write('\n');
           process.exit(130);
+        } else if (char === '\u0004') { // Ctrl+D (EOF)
+          cleanup();
+          process.stdout.write('\n');
+          resolve(key.trim());
+          return;
         } else if (char === '\r' || char === '\n') {
-          process.stdin.setRawMode(wasRaw ?? false);
-          process.stdin.removeListener('data', onData);
+          cleanup();
           process.stdout.write('\n');
           resolve(key.trim());
           return;
@@ -361,6 +445,9 @@ export async function promptMaskedApiKey(query: string): Promise<string> {
         }
       }
     };
+
     process.stdin.on('data', onData);
+    process.stdin.once('error', onError);
+    process.stdin.once('end', onEnd);
   });
 }

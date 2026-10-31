@@ -38,7 +38,7 @@ export async function doctorCommand(): Promise<void> {
   }
 
   // 3. Provider & Key Diagnostics
-  const activeProviderId = config.activeProvider || 'gemini';
+  const activeProviderId = config.activeProvider || 'openrouter';
   const activeProvider = registry.getProvider(activeProviderId);
   const keys = listConfiguredKeys();
 

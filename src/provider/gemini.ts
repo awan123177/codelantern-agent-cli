@@ -6,6 +6,8 @@ import {
   ModelNotFoundError,
   AuthenticationError,
   TimeoutError,
+  ConnectionTimeoutError,
+  TotalTimeoutError,
   FirstTokenTimeoutError,
   CancelledError
 } from './errors.js';
@@ -27,6 +29,14 @@ import type {
   ModelCapabilities,
   TimingDiagnostics
 } from '../types.js';
+
+export const VERIFIED_GEMINI_MODELS = [
+  'gemini-3.8-flash',
+  'gemini-3.8-pro',
+  'gemini-3.8-flash-tts',
+  'gemini-3.1-flash',
+  'gemini-3.1-pro'
+];
 
 export class GeminiProvider implements IProviderAdapter {
   public id = 'gemini';
@@ -83,21 +93,23 @@ export class GeminiProvider implements IProviderAdapter {
       const testModel = this.defaultModel;
 
       const abortController = new AbortController();
-      const countPromise = client.models.countTokens({
+      const generatePromise = client.models.generateContent({
         model: testModel,
-        contents: 'test',
+        contents: 'Reply only with OK.',
         config: {
+          maxOutputTokens: 5,
           abortSignal: abortController.signal,
           httpOptions: { timeout: 10000 }
         }
       });
 
       await withTimeoutRace(
-        countPromise,
+        generatePromise,
         10000,
-        `Connection check for ${this.displayName}`,
+        `Generation test for ${this.displayName} (${testModel})`,
         abortController.signal,
-        () => abortController.abort()
+        () => abortController.abort(),
+        (t) => new ConnectionTimeoutError(t, this.displayName, testModel)
       );
 
       return {
@@ -106,10 +118,28 @@ export class GeminiProvider implements IProviderAdapter {
         resolvedModel: testModel
       };
     } catch (err: any) {
+      const msg = String(err?.message || err);
+      let formattedError = sanitizeSecrets(msg);
+      if (
+        msg.includes('NOT_FOUND') ||
+        msg.includes('not found') ||
+        msg.includes('is not supported') ||
+        msg.includes('404')
+      ) {
+        formattedError = `Model '${this.defaultModel}' not found or unsupported by ${this.displayName}. Available verified models: ${VERIFIED_GEMINI_MODELS.join(', ')}`;
+      } else if (
+        msg.includes('API_KEY_INVALID') ||
+        msg.includes('API key not valid') ||
+        msg.includes('401') ||
+        msg.includes('403') ||
+        msg.includes('PERMISSION_DENIED')
+      ) {
+        formattedError = `Authentication failed: Invalid or restricted API key for ${this.displayName}.`;
+      }
       return {
         success: false,
         latencyMs: Date.now() - startTime,
-        error: sanitizeSecrets(err.message || String(err))
+        error: formattedError
       };
     }
   }
@@ -169,17 +199,7 @@ export class GeminiProvider implements IProviderAdapter {
     }
 
     // Fallback to verified catalog if discovery API call failed
-    const verifiedModels = [
-      'gemini-3.8-flash',
-      'gemini-2.5-flash',
-      'gemini-2.5-pro',
-      'gemini-2.0-flash',
-      'gemini-2.0-flash-lite',
-      'gemini-1.5-flash',
-      'gemini-1.5-pro'
-    ];
-
-    return verifiedModels.map(id => ({
+    return VERIFIED_GEMINI_MODELS.map(id => ({
       id,
       name: id,
       provider: this.id,
@@ -213,7 +233,7 @@ export class GeminiProvider implements IProviderAdapter {
 
     const timeoutMs = params.timeoutMs || 60000;
     const firstTokenTimeoutMs = params.firstTokenTimeoutMs || 30000;
-    const connectTimeoutMs = Math.min(timeoutMs, 15000); // Bounded connection setup timeout
+    const connectTimeoutMs = params.connectTimeoutMs ?? (params.timeoutMs ? Math.min(params.timeoutMs, 15000) : 15000);
 
     const client = this.getClient({ timeout: connectTimeoutMs });
 
@@ -254,7 +274,7 @@ export class GeminiProvider implements IProviderAdapter {
         params.callbacks.onStateChange(attempts > 1 ? `retrying:${attempts}` : 'connecting');
       }
 
-      const { controller, cleanup } = createLinkedAbortController(params.signal, timeoutMs);
+      const { controller, cleanup } = createLinkedAbortController(params.signal, timeoutMs, t => new TotalTimeoutError(t, this.displayName, params.model));
       config.abortSignal = controller.signal;
 
       try {
@@ -270,7 +290,8 @@ export class GeminiProvider implements IProviderAdapter {
           connectTimeoutMs,
           `Connection to ${this.displayName} (${params.model})`,
           controller.signal,
-          () => controller.abort(new TimeoutError(connectTimeoutMs, `Connection to ${this.displayName} (${params.model})`))
+          () => controller.abort(new ConnectionTimeoutError(connectTimeoutMs, this.displayName, params.model)),
+          (t) => new ConnectionTimeoutError(t, this.displayName, params.model)
         );
 
         timing.connectMs = Date.now() - connectStart;
@@ -365,11 +386,110 @@ export class GeminiProvider implements IProviderAdapter {
           throw err instanceof CancelledError ? err : (params.signal?.reason || new CancelledError());
         }
 
-        if (err instanceof TimeoutError || err instanceof FirstTokenTimeoutError) {
+        if (err instanceof TotalTimeoutError) {
           throw err;
         }
 
         const msg = String(err?.message || err);
+
+        if (
+          msg.includes('NOT_FOUND') ||
+          msg.includes('not found') ||
+          msg.includes('is not supported') ||
+          msg.includes('404')
+        ) {
+          throw new ModelNotFoundError(params.model, this.displayName, VERIFIED_GEMINI_MODELS);
+        }
+
+        // Diagnostic probe: If connection or first token timed out or streaming failed, probe with minimal non-streaming call
+        if (
+          (err instanceof ConnectionTimeoutError ||
+            err instanceof FirstTokenTimeoutError ||
+            err instanceof TimeoutError ||
+            msg.includes('fetch failed')) &&
+          !params.signal?.aborted
+        ) {
+          try {
+            const probeController = new AbortController();
+            const probePromise = client.models.generateContent({
+              model: params.model,
+              contents: 'Hi',
+              config: {
+                maxOutputTokens: 2,
+                abortSignal: probeController.signal,
+                httpOptions: { timeout: 4000 }
+              }
+            });
+            const probeRes = await withTimeoutRace(
+              probePromise,
+              4000,
+              `Diagnostic probe for ${params.model}`,
+              probeController.signal,
+              () => probeController.abort(),
+              (t) => new ConnectionTimeoutError(t, this.displayName, params.model)
+            );
+
+            // If probe succeeded, model is valid but streaming failed; attempt fallback non-streaming generation
+            if (probeRes) {
+              try {
+                const fallbackRes = await client.models.generateContent({
+                  model: params.model,
+                  contents,
+                  config: {
+                    ...config,
+                    httpOptions: { timeout: Math.min(timeoutMs, 30000) }
+                  }
+                });
+                const fallbackText = fallbackRes.text || '';
+                if (params.callbacks.onChunk && fallbackText) {
+                  params.callbacks.onChunk(fallbackText);
+                }
+                timing.connectMs = Date.now() - connectStart;
+                timing.streamMs = 0;
+                timing.totalMs = Date.now() - overallStartTime;
+                return {
+                  text: fallbackText,
+                  toolCalls: [],
+                  usage: {
+                    promptTokens: fallbackRes.usageMetadata?.promptTokenCount ?? 0,
+                    candidatesTokens: fallbackRes.usageMetadata?.candidatesTokenCount ?? 0,
+                    totalTokens: fallbackRes.usageMetadata?.totalTokenCount ?? 0
+                  },
+                  timing
+                };
+              } catch {
+                // Fallback attempt failed, proceed to handle original error
+              }
+            }
+          } catch (probeErr: any) {
+            const probeMsg = String(probeErr?.message || probeErr);
+            if (
+              probeMsg.includes('NOT_FOUND') ||
+              probeMsg.includes('not found') ||
+              probeMsg.includes('is not supported') ||
+              probeMsg.includes('404') ||
+              probeMsg.includes('models/')
+            ) {
+              throw new ModelNotFoundError(params.model, this.displayName, VERIFIED_GEMINI_MODELS);
+            }
+            if (
+              probeMsg.includes('API_KEY_INVALID') ||
+              probeMsg.includes('API key not valid') ||
+              probeMsg.includes('401') ||
+              probeMsg.includes('403') ||
+              probeMsg.includes('PERMISSION_DENIED')
+            ) {
+              throw new AuthenticationError(`Authentication failed for ${this.displayName}: Invalid or restricted API key. Please run 'lantern keys set ${this.id}' or verify GEMINI_API_KEY.`);
+            }
+            if (probeMsg.includes('429') || probeMsg.includes('RESOURCE_EXHAUSTED') || probeMsg.includes('quota')) {
+              throw new RateLimitError(`Rate limit or quota reached for ${this.displayName}. Please wait a few seconds before retrying.`);
+            }
+          }
+        }
+
+        if (err instanceof ConnectionTimeoutError || err instanceof FirstTokenTimeoutError || err instanceof TimeoutError) {
+          throw err;
+        }
 
         if (
           msg.includes('API_KEY_INVALID') ||
@@ -379,15 +499,6 @@ export class GeminiProvider implements IProviderAdapter {
           msg.includes('PERMISSION_DENIED')
         ) {
           throw new AuthenticationError(`Authentication failed for ${this.displayName}: Invalid or restricted API key. Please run 'lantern keys set ${this.id}' or verify GEMINI_API_KEY.`);
-        }
-
-        if (
-          msg.includes('NOT_FOUND') ||
-          msg.includes('not found') ||
-          msg.includes('is not supported') ||
-          msg.includes('models/')
-        ) {
-          throw new ModelNotFoundError(params.model, this.displayName);
         }
 
         const isRateLimit = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');

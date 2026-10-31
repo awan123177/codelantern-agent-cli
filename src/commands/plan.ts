@@ -18,15 +18,17 @@ export async function planCommand(
     json?: boolean;
     maxSteps?: number;
     timeout?: number;
+    connectTimeout?: number;
     firstTokenTimeout?: number;
     timing?: boolean;
     skill?: string[];
+    noSkills?: boolean;
   }
 ): Promise<void> {
   const config = loadConfig();
   const workspace = options.cwd || process.cwd();
-  const provider = options.provider || config.activeProvider || 'gemini';
-  const model = options.model || config.defaultModel || 'gemini-3.8-flash';
+  const provider = options.provider || config.activeProvider || 'openrouter';
+  const model = options.model || config.defaultModel || 'openrouter/free';
   const jsonOutput = Boolean(options.json);
   const showTiming = Boolean(options.timing ?? config.showTiming);
 
@@ -69,10 +71,12 @@ export async function planCommand(
     jsonOutput,
     maxSteps: options.maxSteps || config.maxSteps || 25,
     timeoutMs: options.timeout || config.timeoutMs || 60000,
+    connectTimeoutMs: options.connectTimeout || config.connectTimeoutMs || 15000,
     firstTokenTimeoutMs: options.firstTokenTimeout || config.firstTokenTimeoutMs || 30000,
     showTiming,
     lowLatency: false,
-    activeSkills: options.skill || config.activeSkills || [],
+    activeSkills: options.noSkills ? [] : (options.skill || []),
+    noSkills: Boolean(options.noSkills),
     attachments,
     signal: abortController.signal
   };
@@ -94,6 +98,13 @@ export async function planCommand(
       }, null, 2));
     } else {
       console.log(pc.dim(`\n[Plan complete. Session ID: ${session.id}]`));
+      if (result.usage && result.usage.totalTokens > 0) {
+        if (result.usage.promptTokens > 0) {
+          console.log(pc.dim(`[Tokens: ${result.usage.totalTokens.toLocaleString()} (Prompt: ${result.usage.promptTokens.toLocaleString()}, Completion: ${result.usage.candidatesTokens.toLocaleString()})]`));
+        } else {
+          console.log(pc.dim(`[Tokens: ${result.usage.totalTokens.toLocaleString()}]`));
+        }
+      }
       if (showTiming && result.timing) {
         console.log(pc.dim(`[Total Plan Time: ${(result.timing.totalMs / 1000).toFixed(2)}s]`));
       }

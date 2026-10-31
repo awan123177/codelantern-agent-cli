@@ -1,6 +1,10 @@
-import { TimeoutError, FirstTokenTimeoutError, CancelledError } from './errors.js';
+import { TimeoutError, FirstTokenTimeoutError, TotalTimeoutError, CancelledError } from './errors.js';
 
-export function createLinkedAbortController(parentSignal?: AbortSignal, timeoutMs?: number): {
+export function createLinkedAbortController(
+  parentSignal?: AbortSignal,
+  timeoutMs?: number,
+  timeoutErrorFactory?: (timeoutMs: number) => Error
+): {
   controller: AbortController;
   cleanup: () => void;
 } {
@@ -9,7 +13,8 @@ export function createLinkedAbortController(parentSignal?: AbortSignal, timeoutM
 
   if (timeoutMs && timeoutMs > 0) {
     timer = setTimeout(() => {
-      controller.abort(new TimeoutError(timeoutMs));
+      const err = timeoutErrorFactory ? timeoutErrorFactory(timeoutMs) : new TotalTimeoutError(timeoutMs);
+      controller.abort(err);
     }, timeoutMs);
   }
 
@@ -47,7 +52,8 @@ export async function withTimeoutRace<T>(
   timeoutMs: number,
   operationName: string,
   signal?: AbortSignal,
-  onTimeout?: () => void
+  onTimeout?: () => void,
+  errorFactory?: (timeoutMs: number, operation: string) => Error
 ): Promise<T> {
   if (signal?.aborted) {
     throw signal.reason || new CancelledError();
@@ -64,7 +70,7 @@ export async function withTimeoutRace<T>(
             onTimeout();
           } catch {}
         }
-        reject(new TimeoutError(timeoutMs, operationName));
+        reject(errorFactory ? errorFactory(timeoutMs, operationName) : new TimeoutError(timeoutMs, operationName));
       }, timeoutMs);
 
       if (signal) {
@@ -99,8 +105,11 @@ export async function* wrapStreamWithFirstTokenTimeout<T>(
   let firstTokenReceived = false;
   const startTime = Date.now();
   let timer: NodeJS.Timeout | null = null;
+  let abortListener: (() => void) | null = null;
 
+  let rejectTimer: (err: any) => void;
   const timerPromise = new Promise<never>((_, reject) => {
+    rejectTimer = reject;
     timer = setTimeout(() => {
       if (!firstTokenReceived) {
         reject(new FirstTokenTimeoutError(firstTokenTimeoutMs, provider, model));
@@ -108,12 +117,15 @@ export async function* wrapStreamWithFirstTokenTimeout<T>(
     }, firstTokenTimeoutMs);
   });
 
+  let rejectAbort: (err: any) => void;
   const abortPromise = new Promise<never>((_, reject) => {
+    rejectAbort = reject;
     if (signal) {
       if (signal.aborted) {
         reject(signal.reason || new CancelledError());
       } else {
-        signal.addEventListener('abort', () => reject(signal.reason || new CancelledError()), { once: true });
+        abortListener = () => reject(signal.reason || new CancelledError());
+        signal.addEventListener('abort', abortListener, { once: true });
       }
     }
   });
@@ -168,6 +180,9 @@ export async function* wrapStreamWithFirstTokenTimeout<T>(
   } finally {
     if (timer) {
       clearTimeout(timer);
+    }
+    if (signal && abortListener) {
+      signal.removeEventListener('abort', abortListener);
     }
     if (typeof iterator.return === 'function') {
       try {

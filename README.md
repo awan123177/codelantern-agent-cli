@@ -3,10 +3,40 @@
 > **Personal AI coding assistant for the terminal with native OS credential storage, automatic key reuse, multi-provider intelligence, and ironclad safety.**  
 > Terminal command: **`lantern`**  
 > Package: **`codelantern-agent-cli`**  
-> Release status: **`1.0.1` published on npm** | **`1.0.2` prepared locally**  
-> Default provider: **Google Gemini** (`gemini-3.8-flash`)
+> Release status: **`1.0.1` published on npm** | **`1.0.3` prepared locally**  
+> Default provider: **OpenRouter** (`openrouter/free`) | Recommended for broad model choice & zero-cost start
 
-Code Lantern CLI is a resilient, autonomous terminal coding assistant designed to help you inspect, build, edit, and troubleshoot codebases directly from your shell. It connects directly to your chosen AI providers—Google Gemini, OpenRouter, OpenAI, Anthropic Claude, or custom OpenAI-compatible endpoints—with zero third-party agent dependencies.
+Code Lantern CLI is a resilient, autonomous terminal coding assistant designed to help you inspect, build, edit, and troubleshoot codebases directly from your shell. It connects directly to your chosen AI providers—OpenRouter, Google Gemini, OpenAI, Anthropic Claude, or custom OpenAI-compatible endpoints—with zero third-party agent dependencies.
+
+---
+
+## ⚡ What's New in v1.0.3
+
+- 🌐 **OpenRouter & `openrouter/free` as Out-of-the-Box Default**:
+  - **Zero-Cost Exploration**: OpenRouter is now the default provider for new configurations, paired with `openrouter/free` so new users can get started immediately with a zero-cost model once an OpenRouter API key is configured.
+  - **Safe Automatic Migration**: Existing installations with old built-in defaults (`gemini` / `gemini-3.8-flash`) are automatically upgraded to `openrouter` and `openrouter/free` on next load, while user-customized provider or model selections are strictly preserved.
+  - **Preserved Provider Choice**: Switch providers anytime using `lantern providers set-default <name>`, `/provider <name>`, or per-command `--provider <name>`.
+- 🛡️ **Precision On-Demand Skill Loading & Token Inflation Defense**:
+  - **Zero Unwanted Prompt Inflation**: Ordinary requests load 0 skills by default. The CLI no longer injects all installed or enabled skills into requests.
+  - **Accurate Intent Matching**: Simple requests (such as `"Reply only with OK."` or `"hi"`) load zero skill content. If automatic skill selection runs, it selects only a small number of highly relevant skills (max 2).
+  - **`--no-skills` Flag**: Added `--no-skills` option to guarantee that zero skill content is loaded for that run.
+  - **Explicit Skill Disabling**: `lantern skills disable <name>` guarantees that the specified skill is excluded from auto-matching and requests.
+  - **Clear Lifecycle Distinction**: Skill listings distinctly display **Installed** (on disk), **Config Status** (Enabled/Disabled), and **Loaded** (actively injected into the current request).
+  - **Clear Token Usage Reporting**: Prompt and completion tokens are reported distinctly (`Tokens: 385 (Prompt: 341, Completion: 44)`).
+  - **Empty Response Detection**: Providers returning empty responses no longer silently return to the shell; Lantern displays an actionable [`EmptyResponseError`](file:///Users/awanwarsi/Desktop/my%20own%20cli%20/src/provider/errors.ts#L110-L125) with troubleshooting guidance.
+- ⏱️ **Three-Tier Timeout Differentiation**:
+  - **Connection Timeout** (`--connect-timeout <ms>`, default: `15000ms`): Bounded wait time for TLS handshake and initial HTTP response headers. Throws `ConnectionTimeoutError` ("timed out waiting for response headers").
+  - **First-Token Timeout** (`--first-token-timeout <ms>`, default: `30000ms`): Bounded wait time for the model to begin generating tokens once connected. Throws `FirstTokenTimeoutError` ("timed out waiting for the first token").
+  - **Total Elapsed Timeout** (`--timeout <ms>`, default: `60000ms`): Bounded duration for the entire request lifecycle. Throws `TotalTimeoutError` ("timed out after total elapsed time").
+- 🩺 **Authenticated Generation Verification (`lantern providers test`)**:
+  - Replaced lightweight metadata/countTokens checks with real, authenticated minimal generation (`client.models.generateContent`).
+  - Verifies that your API key is authorized to generate tokens and that the targeted model exists before reporting a successful connection.
+- 🔬 **Diagnostic Non-Streaming Probe & SSE Fallback**:
+  - When streaming connection stalls, Lantern automatically runs a non-streaming diagnostic probe to pinpoint whether the issue is a 404 ModelNotFoundError, 401/403 AuthenticationError, or 429 RateLimitError.
+  - If the probe succeeds (proving valid credentials and model reachability), Lantern automatically falls back to full non-streaming generation so user requests complete smoothly.
+- 🔐 **Enhanced Keychain Discovery & Cross-Account Discovery**:
+  - Added fallback service/account discovery in macOS Keychain so existing keys stored under alternate tooling environments are discovered without prompting.
+  - Never leaks secrets or API keys in error outputs, logs, or sessions.
 
 ---
 
@@ -89,7 +119,7 @@ lantern --version
 ```
 *npm automatically generates `lantern.cmd` and `lantern.ps1` wrappers on Windows, placing them in your npm global PATH.*
 
-### Option B: Local Source Installation (v1.0.2)
+### Option B: Local Source Installation (v1.0.3)
 ```bash
 cd "my own cli"
 
@@ -103,7 +133,7 @@ npm run build
 npm link
 
 lantern --version
-# Output: 1.0.2
+# Output: 1.0.3
 ```
 
 ### Starting Code Lantern
@@ -113,40 +143,117 @@ lantern
 ```
 You will be greeted with the banner showing your active provider, model, workspace, and security mode:
 ```text
-🏮 Code Lantern CLI v1.0.2
-Provider: Google Gemini (gemini) | Model: gemini-3.8-flash | Workspace: /path/to/project
+🏮 Code Lantern CLI v1.0.3
+Provider: OpenRouter (openrouter) | Model: openrouter/free | Workspace: /path/to/project
 Status: SAFE MODE (Approval Prompts) | Type /help for commands
 
-lantern (gemini) ❯ 
+lantern (openrouter) ❯ 
 ```
 
 ---
 
-## 🔑 Secure API Key Storage & Automatic Reuse
+## 🔑 OpenRouter Quickstart & Secure Credential Storage
 
-Code Lantern uses a zero-plaintext credential model. You enter your API key once per provider, and Lantern securely stores it in your OS credential store and reuses it automatically across all future commands and sessions.
+Code Lantern defaults to **OpenRouter** and the zero-cost **`openrouter/free`** model, giving you access to broad model variety without upfront payment.
 
-### One-Time Key Setup (Shell)
+### Step 1: Obtain an OpenRouter API Key
+1. Create a free account at [openrouter.ai](https://openrouter.ai).
+2. Generate an API key on your [OpenRouter Keys](https://openrouter.ai/keys) dashboard.
+3. *Note*: Zero-cost models (`openrouter/free` and `:free` models) do not require a credit card or deposited funds.
 
-Run `lantern keys set <provider>`:
+### Step 2: Save Your Key Securely in Lantern
+
+Code Lantern uses native OS credential storage (macOS Keychain or Windows Credential Manager). You enter the key once; Lantern remembers and reuses it securely on all subsequent runs:
+
+#### macOS (Terminal):
 ```bash
-# Set Google Gemini API key
-lantern keys set gemini
-
-# Set OpenRouter API key
 lantern keys set openrouter
-
-# Set OpenAI or Anthropic keys
-lantern keys set openai
-lantern keys set anthropic
 ```
 
-Lantern prompts for your key with a masked input prompt (`*`). As you type, nothing is displayed in plaintext.
-Once entered, Lantern verifies that the key can be retrieved from your native OS store and saves it:
+#### Windows (PowerShell or Command Prompt):
+```powershell
+lantern keys set openrouter
+```
+
+Lantern prompts for your key with a masked input prompt (`*`):
 ```text
-Enter API key for 'gemini': ***************************************
-✓ Successfully saved API key for 'gemini' to macOS Keychain (AIza...W9q0)
+Enter API key for 'openrouter': *******************************************************
+✓ Successfully saved API key for 'openrouter' to macOS Keychain (sk-o...097d)
   Lantern will automatically reuse this key in future sessions and commands.
+```
+
+> **Security Guarantee**:
+> - API keys are **never** stored in plaintext files, logs, session transcripts, or README examples.
+> - Encryption keys are protected by your operating system's native secure credential manager.
+
+---
+
+## 🌐 OpenRouter & `openrouter/free` Details
+
+### Understanding `openrouter/free`
+- **What it is**: `openrouter/free` is OpenRouter's meta-router endpoint that routes requests dynamically to an available free model in OpenRouter's curated [Free Models Collection](https://openrouter.ai/collections/free-models).
+- **Cost**: **$0 per token**. You can experiment freely without spending credits or depositing money.
+- **Availability & Limits**:
+  - Free models are sponsored by providers and community partners; availability, latency, and quality can vary over time.
+  - Rate limits are enforced by OpenRouter (commonly ~20 requests per minute and ~200 requests per day across free endpoints).
+  - OpenRouter may periodically rotate the underlying free models as provider sponsorships change.
+- **Paid Models**: Other models on OpenRouter (such as `anthropic/claude-3.7-sonnet`, `openai/gpt-4o`, `deepseek/deepseek-chat`) require account credits and are billed per token according to [OpenRouter Pricing](https://openrouter.ai/pricing). `openrouter/free` and paid models use the exact same OpenRouter API key.
+
+---
+
+## 🚀 Copyable Quick-Start Examples
+
+### 1. Set OpenRouter & `openrouter/free` as Your Default
+```bash
+# Set OpenRouter as persistent default provider
+lantern providers set-default openrouter
+
+# Set openrouter/free as persistent default model
+lantern models set openrouter/free
+```
+
+*(Inside an active Lantern session, you can alternatively type: `/provider default openrouter` and `/model default openrouter/free`)*
+
+### 2. Make a One-Time Request With OpenRouter
+```bash
+lantern ask --provider openrouter --model openrouter/free "Reply only with OK."
+```
+
+### 3. Switch to Another Provider or Model
+You can override provider and model per request without changing your saved defaults:
+```bash
+# Run one request using Google Gemini
+lantern ask --provider gemini --model gemini-3.8-flash "Explain quicksort in 2 sentences."
+
+# Run one request using Anthropic Claude on OpenRouter
+lantern ask --provider openrouter --model anthropic/claude-3.7-sonnet "Review this function."
+
+# Change persistent default provider to Google Gemini
+lantern providers set-default gemini
+```
+
+### 4. Run With Skills Disabled
+Guarantee zero skill content is injected into your prompt:
+```bash
+lantern ask --no-skills "Reply only with OK."
+```
+
+---
+
+## 🔑 Multi-Provider Key Management
+
+You can configure and switch between multiple AI providers:
+
+### Setting Keys for Additional Providers
+```bash
+# Google Gemini
+lantern keys set gemini
+
+# OpenAI
+lantern keys set openai
+
+# Anthropic Claude
+lantern keys set anthropic
 ```
 
 ### In-Session Automatic Key Entry
@@ -276,18 +383,20 @@ Use these commands from your operating system shell (`bash`, `zsh`, `cmd`, `Powe
 | **`lantern --version`** | Output version string (`1.0.2`) |
 
 ### Global CLI Flags
-- **`-p, --provider <provider>`**: Select provider (`gemini`, `openai`, `anthropic`, `openrouter`, or custom).
-- **`-m, --model <id>`**: Override model ID (default: `gemini-3.8-flash`).
+- **`-p, --provider <provider>`**: Select provider (`openrouter`, `gemini`, `openai`, `anthropic`, or custom).
+- **`-m, --model <id>`**: Override model ID (default: `openrouter/free`).
 - **`-C, --cwd <path>`**: Set workspace directory for agent operations.
 - **`-s, --session <id>`**: Use or resume a specific session ID.
 - **`-a, --attach <files...>`**: Attach text files, images (`.png`, `.jpg`, `.webp`), or PDFs.
 - **`--yolo`**: Skip interactive confirmation prompts for file edits and shell commands.
 - **`--json`**: Output results formatted as JSON.
-- **`--timeout <ms>`**: Maximum total request duration (default: `60000`).
-- **`--first-token-timeout <ms>`**: Maximum wait time for initial response token (default: `30000`).
+- **`--timeout <ms>`**: Maximum total request duration in milliseconds (default: `60000`).
+- **`--connect-timeout <ms>`**: Maximum wait time for connection/headers in milliseconds (default: `15000`).
+- **`--first-token-timeout <ms>`**: Maximum wait time for initial response token in milliseconds (default: `30000`).
 - **`--timing`**: Display detailed execution and latency timing diagnostics.
 - **`--fast`**: Enable low-latency mode where supported.
-- **`--skill <skills...>`**: Explicitly activate one or more skills for the run.
+- **`--skill <skills>`**: Explicitly activate one or more skills for the run (comma-separated or repeated).
+- **`--no-skills`**: Disable all skills for this run (guarantees zero skill content is loaded).
 
 ---
 
@@ -326,6 +435,11 @@ lantern skills disable build-your-own-x
 lantern skills remove build-your-own-x
 ```
 
+### Skill Lifecycle & Invariants
+- **Installed**: Skill files reside on disk in user or project directories.
+- **Enabled**: Skill is permitted in configuration for on-demand use and automatic matching (`lantern skills enable/disable <name>`).
+- **Loaded**: Skill instructions are actively injected into the request prompt. For normal requests, skills load on-demand only when matched by high-intent keywords (capped at 2) or explicitly passed with `--skill <name>`. Simple prompts load 0 skills. Use `--no-skills` to guarantee no skill content is loaded.
+
 ---
 
 ## 🛡️ Safe Mode & Invariants
@@ -354,12 +468,12 @@ Example output:
 ──────────────────────────────────────────────────────────────────────────────
 ✓ Platform / OS:          macOS (Apple Silicon)
 ✓ Node.js Runtime:        v26.12.1 (compatible)
-✓ Active Provider:        Google Gemini (gemini)
-✓ Active Model:           gemini-3.8-flash
+✓ Active Provider:        OpenRouter (openrouter)
+✓ Active Model:           openrouter/free
 ✓ Credential Storage:     macOS Keychain
-✓ API Key (gemini):       Configured [macOS Keychain] (AIza...W9q0)
+✓ API Key (openrouter):   Configured [macOS Keychain] (sk-o...097d)
 ✓ Provider Auth & Ping:   Verified (295ms latency)
-✓ Additional Providers:   Configured (openrouter)
+ℹ Additional Providers:   Configured (gemini)
 ✓ Git CLI:                Available (git version 2.54.0)
 ✓ Config File:            ~/.codelantern/config.json (Timeout: 60000ms, TTFT: 30000ms)
 ✓ Session Storage:        ~/.codelantern/sessions (2 stored session(s))

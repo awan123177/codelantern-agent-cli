@@ -60,7 +60,7 @@ export async function modelsCommand(
     }
 
     console.log(pc.dim('\nTo set active model: lantern model set <model-id>'));
-    console.log(pc.dim(`Example: lantern model set ${models[0]?.id || 'gemini-3.8-flash'}\n`));
+    console.log(pc.dim(`Example: lantern model set ${models[0]?.id || 'openrouter/free'}\n`));
     return;
   }
 

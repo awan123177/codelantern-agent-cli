@@ -84,7 +84,7 @@ export async function providersCommand(
   }
 
   if (subAction === 'test') {
-    const targetProvider = target || loadConfig().activeProvider || 'gemini';
+    const targetProvider = target || loadConfig().activeProvider || 'openrouter';
     const p = registry.getProvider(targetProvider);
 
     console.log(`Testing connection to ${pc.cyan(p.displayName)}...`);

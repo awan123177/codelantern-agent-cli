@@ -51,6 +51,23 @@ export function loadConfig(): OrbitConfig {
       merged.mcpServers = {};
     }
 
+    // When upgrading an existing installation, preserve user-selected provider and model settings.
+    // Migrate only settings that are still the CLI's old built-in defaults ('gemini' and old default models).
+    const oldDefaultProviders = ['gemini'];
+    const oldDefaultModels = ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-1.5-flash'];
+    const isOldDefaultProvider = oldDefaultProviders.includes(parsed.activeProvider);
+    const isOldDefaultModel = !parsed.defaultModel || oldDefaultModels.includes(parsed.defaultModel);
+
+    if (isOldDefaultProvider && isOldDefaultModel) {
+      merged.activeProvider = 'openrouter';
+      merged.defaultModel = 'openrouter/free';
+      try {
+        saveConfig(merged);
+      } catch {
+        // ignore
+      }
+    }
+
     return merged;
   } catch {
     return { ...DEFAULT_CONFIG };
@@ -74,6 +91,7 @@ export function saveConfig(config: OrbitConfig): void {
     showTiming: Boolean(config.showTiming),
     lowLatency: Boolean(config.lowLatency),
     activeSkills: Array.isArray(config.activeSkills) ? config.activeSkills : [],
+    disabledSkills: Array.isArray((config as any).disabledSkills) ? (config as any).disabledSkills : [],
     mcpServers: config.mcpServers || {},
     providers: config.providers || {}
   };

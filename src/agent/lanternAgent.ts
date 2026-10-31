@@ -10,6 +10,7 @@ import { shouldCompact, compactTurns } from '../session/compactor.js';
 import { SkillManager } from '../skills/skillManager.js';
 import { TerminalSpinner } from '../ui/spinner.js';
 import { sanitizeSecrets } from '../security/secrets.js';
+import { EmptyResponseError } from '../provider/errors.js';
 import type {
   OrbitSession,
   AgentContext,
@@ -134,16 +135,19 @@ export class LanternAgent {
     });
 
     // 1. Resolve active skills
-    const candidateSkills = this.skillManager.matchSkillsForPrompt(userPrompt, context.workspace);
-    const explicitlyRequested = (context.activeSkills || []).map(name =>
-      this.skillManager.getSkill(name, context.workspace)
-    ).filter((s): s is Skill => Boolean(s));
+    let activeSkills: Skill[] = [];
 
-    const combinedSkillsMap = new Map<string, Skill>();
-    for (const s of [...explicitlyRequested, ...candidateSkills]) {
-      combinedSkillsMap.set(s.name, s);
+    if (context.noSkills) {
+      activeSkills = [];
+    } else if (context.activeSkills && context.activeSkills.length > 0) {
+      // User explicitly selected skills with --skill or in-session /skills
+      activeSkills = context.activeSkills
+        .map(name => this.skillManager.getSkill(name, context.workspace))
+        .filter((s): s is Skill => s !== null && s.enabled);
+    } else {
+      // Normal request: automatically select only a small number of relevant skills (max 2)
+      activeSkills = this.skillManager.matchSkillsForPrompt(userPrompt, context.workspace);
     }
-    const activeSkills = Array.from(combinedSkillsMap.values());
 
     if (activeSkills.length > 0 && !context.jsonOutput) {
       const names = activeSkills.map(s => pc.yellow(s.name)).join(', ');
@@ -208,6 +212,7 @@ export class LanternAgent {
           signal: context.signal,
           temperature: 0.2,
           timeoutMs: context.timeoutMs,
+          connectTimeoutMs: context.connectTimeoutMs,
           firstTokenTimeoutMs: context.firstTokenTimeoutMs,
           lowLatency: context.lowLatency,
           callbacks: {
@@ -364,6 +369,10 @@ export class LanternAgent {
         this.spinner.stop();
         throw err;
       }
+    }
+
+    if (!finalAssistantText.trim() && totalToolsExecuted === 0) {
+      throw new EmptyResponseError(provider.displayName, context.model);
     }
 
     // Auto-compact if session turns exceed threshold

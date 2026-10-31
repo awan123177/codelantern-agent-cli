@@ -46,6 +46,9 @@ export class TerminalPrompt {
     return new Promise(resolve => {
       rl.question(query, answer => {
         rl.close();
+        try {
+          process.stdin.pause();
+        } catch {}
         resolve(answer.trim());
       });
     });

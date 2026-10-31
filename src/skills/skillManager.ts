@@ -35,16 +35,17 @@ export class SkillManager {
   public listSkills(workspace = process.cwd()): Skill[] {
     const skillsMap: Map<string, Skill> = new Map();
     const config = loadConfig();
-    const activeSkillsList = new Set(config.activeSkills || []);
+    const activeSkillsList = new Set<string>((config.activeSkills || []).map(s => s.toLowerCase()));
+    const disabledSkillsList = new Set<string>(((config as any).disabledSkills || []).map((s: string) => s.toLowerCase()));
 
     // 1. Load User-level skills
-    this.scanDirectoryForSkills(this.userSkillsDir, 'user', skillsMap, activeSkillsList);
+    this.scanDirectoryForSkills(this.userSkillsDir, 'user', skillsMap, activeSkillsList, disabledSkillsList);
 
     // 2. Load Project-level skills (project-level overrides user-level of same name)
     const projectDirs = this.getProjectSkillsDirs(workspace);
     for (const pDir of projectDirs) {
       if (fs.existsSync(pDir)) {
-        this.scanDirectoryForSkills(pDir, 'project', skillsMap, activeSkillsList);
+        this.scanDirectoryForSkills(pDir, 'project', skillsMap, activeSkillsList, disabledSkillsList);
       }
     }
 
@@ -55,7 +56,8 @@ export class SkillManager {
     rootDir: string,
     source: 'project' | 'user',
     map: Map<string, Skill>,
-    activeSkillsList: Set<string>
+    activeSkillsList: Set<string>,
+    disabledSkillsList: Set<string>
   ): void {
     if (!fs.existsSync(rootDir)) return;
 
@@ -87,14 +89,16 @@ export class SkillManager {
               }
             }
 
-            const isExplicitlyActive = activeSkillsList.has(name);
+            const isExplicitlyDisabled = disabledSkillsList.has(name.toLowerCase());
+            const isExplicitlyActive = activeSkillsList.has(name.toLowerCase());
+            const enabled = isExplicitlyActive && !isExplicitlyDisabled;
 
             map.set(name, {
               name,
               description,
               path: skillFolder,
               source,
-              enabled: isExplicitlyActive,
+              enabled,
               content,
               references
             });
@@ -149,20 +153,40 @@ export class SkillManager {
 
   public enableSkill(name: string): boolean {
     const config = loadConfig();
-    const skills = new Set(config.activeSkills || []);
-    skills.add(name);
-    config.activeSkills = Array.from(skills);
+    const norm = name.trim();
+    const lower = norm.toLowerCase();
+
+    // Remove from disabledSkills
+    const disabled = new Set(((config as any).disabledSkills || []).map((s: string) => s.toLowerCase()));
+    disabled.delete(lower);
+    (config as any).disabledSkills = Array.from(disabled);
+
+    // Add to activeSkills
+    const skills = (config.activeSkills || []).filter(s => s.toLowerCase() !== lower);
+    skills.push(norm);
+    config.activeSkills = skills;
+
     saveConfig(config);
     return true;
   }
 
   public disableSkill(name: string): boolean {
     const config = loadConfig();
-    const skills = new Set(config.activeSkills || []);
-    const removed = skills.delete(name);
-    config.activeSkills = Array.from(skills);
+    const norm = name.trim();
+    const lower = norm.toLowerCase();
+
+    // Remove from activeSkills
+    const skills = (config.activeSkills || []).filter(s => s.toLowerCase() !== lower);
+    const wasActive = skills.length !== (config.activeSkills || []).length;
+    config.activeSkills = skills;
+
+    // Add to disabledSkills
+    const disabled = new Set(((config as any).disabledSkills || []).map((s: string) => s.toLowerCase()));
+    disabled.add(lower);
+    (config as any).disabledSkills = Array.from(disabled);
+
     saveConfig(config);
-    return removed;
+    return wasActive || disabled.has(lower);
   }
 
   private discoverSkillFiles(dir: string, depth = 0, maxDepth = 4): string[] {
@@ -305,42 +329,94 @@ export class SkillManager {
   }
 
   /**
-   * Matches prompt against available skills by keyword and intent.
-   * Transparent and non-intrusive.
+   * Matches prompt against available enabled skills by keyword and intent.
+   * Simple requests like "Reply only with OK." select NONE.
+   * Automatically selects only a small number of relevant skills (max 2).
    */
   public matchSkillsForPrompt(userPrompt: string, workspace = process.cwd()): Skill[] {
+    const promptTrimmed = userPrompt.trim();
+    if (!promptTrimmed) return [];
+
+    const promptLower = promptTrimmed.toLowerCase();
+    const cleanWords = promptLower.split(/[\s,.;:!?_/\-\\"'()]+/).filter(w => w.length > 0);
+
+    // Trivial prompts like "ok", "hi", "reply only with ok", "hello" must select none
+    if (
+      cleanWords.length <= 6 && (
+        promptLower.includes('reply only with') ||
+        promptLower.includes('reply with') ||
+        promptLower === 'ok' ||
+        promptLower === 'hi' ||
+        promptLower === 'hello' ||
+        promptLower === 'test' ||
+        promptLower === 'ping'
+      )
+    ) {
+      return [];
+    }
+
     const allSkills = this.listSkills(workspace);
-    const matched: Skill[] = [];
-    const promptLower = userPrompt.toLowerCase();
+    // Only consider enabled skills — disabled skills are strictly excluded
+    const enabledSkills = allSkills.filter(s => s.enabled);
+    if (enabledSkills.length === 0) return [];
 
-    for (const skill of allSkills) {
-      // 1. If explicitly enabled in config, it's always included
-      if (skill.enabled) {
-        matched.push(skill);
-        continue;
+    const STOPWORDS = new Set([
+      'with', 'this', 'that', 'from', 'when', 'your', 'code', 'system', 'using',
+      'tool', 'tools', 'what', 'where', 'which', 'about', 'after', 'before', 'each',
+      'other', 'their', 'there', 'these', 'could', 'would', 'should', 'first',
+      'into', 'some', 'make', 'more', 'only', 'want', 'need', 'like', 'help',
+      'please', 'show', 'tell', 'work', 'working', 'write', 'create', 'build',
+      'step', 'guides', 'guide', 'read', 'file', 'files', 'data', 'user'
+    ]);
+
+    const escapeRegExp = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    const scored: { skill: Skill; score: number }[] = [];
+
+    for (const skill of enabledSkills) {
+      let score = 0;
+      const skillNameLower = skill.name.toLowerCase();
+
+      // 1. Explicit mention of skill name (e.g., "build-your-own-x" or "Build Your Own X")
+      const skillNameNormalized = skillNameLower.replace(/[-_]/g, ' ');
+      const skillNameExactPattern = new RegExp(`\\b${escapeRegExp(skill.name)}\\b`, 'i');
+      const skillNameNormPattern = new RegExp(`\\b${escapeRegExp(skillNameNormalized)}\\b`, 'i');
+
+      if (skillNameExactPattern.test(userPrompt) || skillNameNormPattern.test(userPrompt)) {
+        score += 50;
       }
 
-      // 2. Keyword check against skill name and description
-      const skillName = skill.name.toLowerCase();
-      const descWords = skill.description.toLowerCase().split(/\W+/).filter(w => w.length > 3);
-
-      if (promptLower.includes(skillName)) {
-        matched.push(skill);
-        continue;
+      // Check if user explicitly asked for "skill <name>" or "<name> skill"
+      if (promptLower.includes(`skill ${skillNameLower}`) || promptLower.includes(`${skillNameLower} skill`)) {
+        score += 60;
       }
 
-      let matchCount = 0;
-      for (const word of descWords) {
-        if (promptLower.includes(word)) {
-          matchCount++;
+      // 2. High-value keyword matching from description
+      const descTokens = skill.description
+        .toLowerCase()
+        .split(/[\s,.;:!?_/\-\\"'()]+/)
+        .filter(w => w.length >= 5 && !STOPWORDS.has(w));
+
+      let matchedDescTokens = 0;
+      for (const token of new Set(descTokens)) {
+        const wordPattern = new RegExp(`\\b${escapeRegExp(token)}\\b`, 'i');
+        if (wordPattern.test(promptLower)) {
+          matchedDescTokens++;
         }
       }
 
-      if (matchCount >= 2) {
-        matched.push(skill);
+      if (matchedDescTokens >= 2) {
+        score += matchedDescTokens * 8;
+      }
+
+      // Only match skills with strong relevance (score >= 20)
+      if (score >= 20) {
+        scored.push({ skill, score });
       }
     }
 
-    return matched;
+    // Sort by relevance score descending and cap at max 2 relevant skills
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, 2).map(item => item.skill);
   }
 }

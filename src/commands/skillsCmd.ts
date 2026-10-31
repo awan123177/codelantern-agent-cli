@@ -10,12 +10,15 @@ export async function skillsCommand(
 
   if (subAction === 'list') {
     const skills = manager.listSkills();
+    const enabledCount = skills.filter(s => s.enabled).length;
     console.log('\n' + pc.bold(pc.yellow('🏮 Installed Code Lantern Skills')));
+    console.log(pc.dim(`Installed: ${skills.length} | Config Enabled: ${enabledCount} | Loaded in this run: None (on-demand)`));
     console.log(pc.dim('──────────────────────────────────────────────────────────────────────────────'));
     console.log(
-      pc.bold('Skill Name'.padEnd(24)) +
+      pc.bold('Skill Name'.padEnd(28)) +
       pc.bold('Source'.padEnd(12)) +
-      pc.bold('Status'.padEnd(14)) +
+      pc.bold('Config Status'.padEnd(16)) +
+      pc.bold('Loaded In Run'.padEnd(16)) +
       pc.bold('Description')
     );
     console.log(pc.dim('──────────────────────────────────────────────────────────────────────────────'));
@@ -28,17 +31,23 @@ export async function skillsCommand(
     }
 
     for (const s of skills) {
-      const statusText = s.enabled ? pc.green('✓ Active') : pc.dim('Disabled');
+      const statusText = s.enabled ? pc.green('Enabled') : pc.dim('Disabled');
+      const loadedText = pc.dim('No (on-demand)');
       const sourceText = s.source === 'project' ? pc.cyan('[project]') : pc.blue('[user]');
 
       console.log(
-        pc.bold(s.name.padEnd(24)) +
-        sourceText.padEnd(20) +
-        statusText.padEnd(22) +
-        pc.dim(s.description.slice(0, 40))
+        pc.bold(s.name.padEnd(28)) +
+        sourceText.padEnd(12) +
+        statusText.padEnd(25) +
+        loadedText.padEnd(25) +
+        pc.dim(s.description.slice(0, 35))
       );
     }
 
+    console.log(pc.dim('\nDistinction Guide:'));
+    console.log(pc.dim('  • Installed: Discovered in user/project skill directories.'));
+    console.log(pc.dim('  • Enabled:   Eligible in config for auto-selection (lantern skills enable/disable <name>).'));
+    console.log(pc.dim('  • Loaded:    Content injected into prompt (via --skill <name> or auto-matching).'));
     console.log(pc.dim('\nTo inspect: lantern skills show <name>'));
     console.log(pc.dim('To enable:  lantern skills enable <name>'));
     console.log(pc.dim('To disable: lantern skills disable <name>'));
@@ -60,12 +69,12 @@ export async function skillsCommand(
 
     console.log('\n' + pc.bold(pc.yellow(`🏮 Skill: ${skill.name}`)));
     console.log(pc.dim('──────────────────────────────────────────────────────────────────────────────'));
-    console.log(`${pc.bold('Source:')}      ${skill.source}`);
-    console.log(`${pc.bold('Path:')}        ${skill.path}`);
-    console.log(`${pc.bold('Status:')}      ${skill.enabled ? pc.green('Enabled') : pc.dim('Disabled')}`);
-    console.log(`${pc.bold('Description:')} ${skill.description}`);
+    console.log(`${pc.bold('Installed:')}     Yes (${skill.source} directory: ${skill.path})`);
+    console.log(`${pc.bold('Config Status:')} ${skill.enabled ? pc.green('Enabled (eligible for on-demand loading)') : pc.dim('Disabled (excluded from requests)')}`);
+    console.log(`${pc.bold('Loaded:')}        No (only loaded on-demand via --skill or auto-match)`);
+    console.log(`${pc.bold('Description:')}   ${skill.description}`);
     if (skill.references && skill.references.length > 0) {
-      console.log(`${pc.bold('References:')}  ${skill.references.length} reference file(s) available`);
+      console.log(`${pc.bold('References:')}    ${skill.references.length} reference file(s) available`);
     }
     console.log(pc.dim('──────────────────────────────────────────────────────────────────────────────'));
     console.log('\n' + pc.cyan('Instructions Content:'));
@@ -98,7 +107,7 @@ export async function skillsCommand(
     }
 
     manager.disableSkill(target);
-    console.log(pc.yellow(`✓ Disabled skill '${target}'`));
+    console.log(pc.yellow(`✓ Disabled skill '${target}' (excluded from future requests and matching)`));
     return;
   }
 
